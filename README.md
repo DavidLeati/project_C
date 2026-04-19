@@ -15,9 +15,3 @@ A finalidade deste repositório isolado é promover a contra-validação dos ben
 ### Compatibilidade e Governança (`learning/` e `runtime/`)
 
 Esta ablação foi arquitetada para encaixar suavemente em todo o restante do maquinário base: operando perfeitamente junto a função avaliadora multiescalar unificada do HSAMA e respondendo adequadamente as anomalias de transição de regime comutadas pelo motor de Replay do modelo ativo.
-
-## Instalação
-
-```bash
-pip install -e .
-```
