@@ -10,7 +10,7 @@ A finalidade deste repositório isolado é promover a contra-validação dos ben
 
 - **MLP Edge with Dynamic Bias (`src/models/hsama.py`)**: A interconexão entre as malhas neurais do grafo abandona os _splines_ do KAN e os substitui por uma MLP oculta rudimentar de duas frentes (W1, W2) costuradas com uma ativação em `SiLU`.
 - Neste arranjo, o DNA meta-gerado pelas hiper-redes não constrói a forma da ativação, mas atua meramente como um "**Viés Dinâmico**" acrescido a essas transformações lineares.
-- Semelhante as outras vias de ablação, bibliotecas residuais (como `kan.py`) permanecem inativadas na hierarquia de arquivos e seu motor matemático é suprimido na roteirização do `forward`.
+- Bibliotecas residuais (como `kan.py`) permanecem inativadas na hierarquia de arquivos e seu motor matemático é suprimido na roteirização do `forward`.
 
 ### Compatibilidade e Governança (`learning/` e `runtime/`)
 
