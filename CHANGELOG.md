@@ -2,6 +2,42 @@
 
 ---
 
+## Abril de 2026 - Semana 4 (19/04 a 25/04)
+
+*Foco: Backtest em Dados Reais, Arquitetura Multi-Agente por Timeframe e Suporte a GPU*
+
+### Avanços:
+
+- **Construção do Motor de Backtest Multi-Timeframe para Solana (21/04):**
+
+  - Implementação do `SolanaMultiTFEngine` (`trade/engine.py`), substituindo o motor de agente único por uma arquitetura de **5 T0s independentes**: quatro previsores de log-retorno (SOL/USDT 15m, 1h, 4h, 1d) e um agente de trading que recebe as 4 previsões como features adicionais e otimiza posição via `TriplexTradingLoss`.
+  - Cada previsor possui seu próprio `MultiScaleT0Config` com escalas *fast/slow* calibradas para o horizonte do seu timeframe (ex.: T0_1d com `stride=1, history_length=7` captura 7 dias de regime).
+  - O agente trader opera com `in_features = features_15m + 4` (sinais dos previsores concatenados), conectando os quatro horizontes temporais em uma única decisão de posição long/short contínua.
+- **Pipeline de Alinhamento Multi-Timeframe sem Look-ahead Bias (21/04):**
+
+  - Criação do método `load_multi_timeframe_sol()` em `trade/dataset.py`, que carrega os 4 arquivos Parquet da SOL, re-indexa os timeframes maiores (1h, 4h, 1d) ao grid de 15m via `.reindex() + .ffill()` e processa features com `window_size` proporcional a cada granularidade.
+  - O alinhamento garante que o dado de uma vela diária só se torna visível nos passos de 15m *após* o fechamento daquela vela, eliminando qualquer contaminação futura nos tensores de treino e teste.
+  - Split cronológico sincronizado: todos os timeframes são truncados ao comprimento mínimo comum antes da divisão train/test, mantendo o alinhamento temporal perfeito entre os 5 agentes.
+- **Suporte a CUDA e Detecção Automática de Dispositivo (21/04):**
+
+  - O engine detecta automaticamente CUDA na inicialização (`torch.cuda.is_available()`) e reporta o nome da GPU. Todos os modelos HSAMA e os `MultiScaleT0Builder` (GRUs + projeções) são movidos para o dispositivo via `_move_runtime_to_device()`.
+  - Os tensores X/Y de todos os timeframes são transferidos para o device em bloco ao início do backtest, eliminando transferências host↔device por batch durante o treino.
+  - Tensores de resultado (`posicoes_teste`, `Y_test_15m`) retornam a `.cpu()` apenas para métricas finais e geração de gráficos.
+- **Aquisição de Dados Históricos via Binance (`fetch_binance.py`) (21/04):**
+
+  - Script de coleta que baixa candles históricos da Binance para múltiplos pares e intervalos (15m, 1h, 4h, 1d), replicando a estrutura de colunas (`open_time`, `open`, `high`, `low`, `close`, `volume`) e salvando em Parquet no diretório `trade/data/`.
+- **Instalação e Configuração do Ambiente de Trade (21/04):**
+
+  - Instalação do pacote `pyarrow` para suporte a leitura de Parquet e do projeto em modo editable (`pip install -e .`) para resolver resolução de módulos ao executar scripts diretamente.
+  - Adição de guard de `sys.path` em `engine.py` e `dataset.py` com fallback de imports absolutos, permitindo execução tanto como script direto (`python trade\engine.py`) quanto como módulo de pacote.
+
+### Atrasos:
+
+- **Custo Computacional do Treino Online em CPU (21/04):**
+  - O volume de dados (175k passos de 15m × 5 agentes × 2 épocas) tornava o treino inviável em CPU (~horas). A adição de suporte a CUDA foi necessária para viabilizar iterações rápidas, o que atrasou o primeiro resultado de backtest OOS completo.
+
+---
+
 ## Abril de 2026 - Semana 3 (12/04 a 18/04)
 
 *Foco: Padronização, Benchmarks Competitivos e Refatoração de Diretórios Globais*
