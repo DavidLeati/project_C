@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, Tuple, Optional
 
@@ -92,6 +93,69 @@ def _move_runtime_to_device(runtime: HSAMAOnlineRuntime, device: torch.device) -
 
 
 # ---------------------------------------------------------------------------
+# Normalizador EMA causal para sinais dos previsores
+# ---------------------------------------------------------------------------
+
+class EMASignalNormalizer:
+    """
+    Normaliza os sinais dos 4 previsores de forma causal — sem look-ahead.
+
+    Cada batch e normalizado usando estatisticas (media e variancia EMA)
+    acumuladas EXCLUSIVAMENTE dos batches anteriores.
+    Apos cada batch, o estado EMA e atualizado com as estatisticas do batch atual.
+
+    Para o primeiro batch nao ha historico disponivel — usa as proprias
+    estatisticas do batch (unico caso inevitavel, impacto negligivel).
+
+    Durante inferencia OOS, o estado e congelado no final do treino:
+    usa normalize_frozen() para aplicar a mesma escala sem atualizar o EMA.
+    """
+
+    def __init__(self, num_signals: int, decay: float = 0.99):
+        self.decay       = decay
+        self.num_signals = num_signals
+        self.mu          : Optional[torch.Tensor] = None  # [1, num_signals]
+        self.var         : Optional[torch.Tensor] = None  # [1, num_signals]
+        self._initialized = False
+
+    def normalize(self, signals: torch.Tensor) -> torch.Tensor:
+        """
+        Normaliza signals [B, num_signals] com estatisticas ANTERIORES ao batch,
+        depois atualiza o EMA com as estatisticas deste batch.
+        """
+        batch_mu  = signals.mean(dim=0, keepdim=True).detach()
+        batch_var = signals.var( dim=0, keepdim=True).clamp(min=1e-12).detach()
+
+        if not self._initialized:
+            # Primeiro batch: sem historico — inicializa e normaliza com o proprio batch
+            self.mu  = batch_mu
+            self.var = batch_var
+            self._initialized = True
+            std = batch_var.sqrt().clamp(min=1e-6)
+            return ((signals - batch_mu) / std).clamp(-3.0, 3.0)
+
+        # Normaliza com estatisticas ANTERIORES (causal, sem look-ahead)
+        std  = self.var.sqrt().clamp(min=1e-6)
+        norm = ((signals - self.mu) / std).clamp(-3.0, 3.0)
+
+        # Atualiza EMA com o batch atual (para o proximo batch usar)
+        self.mu  = self.decay * self.mu  + (1.0 - self.decay) * batch_mu
+        self.var = self.decay * self.var + (1.0 - self.decay) * batch_var
+
+        return norm
+
+    def normalize_frozen(self, signals: torch.Tensor) -> torch.Tensor:
+        """
+        Normaliza usando o estado final do treino, sem atualizar o EMA.
+        Usado durante inferencia OOS para garantir consistencia de escala.
+        """
+        if not self._initialized:
+            return signals  # fallback: sem historico, retorna bruto
+        std = self.var.sqrt().clamp(min=1e-6)
+        return ((signals - self.mu) / std).clamp(-3.0, 3.0)
+
+
+# ---------------------------------------------------------------------------
 # Motor principal
 # ---------------------------------------------------------------------------
 
@@ -112,7 +176,9 @@ class SolanaMultiTFEngine:
 
     def __init__(self, data_dir: str = "trade/data"):
         self.loader = CryptoDataLoader(data_dir=data_dir)
-        self.batch_size = 32
+        self.batch_size   = 32
+        self.max_samples  = 20_000   # ultimos N passos 15m usados para treino+teste
+        self.report_every = 100      # imprime progresso a cada N batches
 
         # Device auto-detect
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,36 +244,17 @@ class SolanaMultiTFEngine:
             multi_scale_t0_config=_make_trade_config(),
         )
         runtime = HSAMAOnlineRuntime(model, config=config)
-        runtime._per_sample_loss = TriplexTradingLoss(cost_bps=0.0005, trade_weight=2.0)
+        runtime._per_sample_loss = TriplexTradingLoss(
+            cost_bps=0.0005,
+            trade_weight=10.0,   # Restaurado
+            return_scale=100.0,
+            entropy_weight=0.05,
+            bias_weight=2.0,
+        )
 
         # Move para GPU
         _move_runtime_to_device(runtime, self.device)
         return runtime
-
-    # ------------------------------------------------------------------
-    # Pipeline de inferencia dos previsores
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _get_predictor_signals(
-        self,
-        predictors: Dict[str, HSAMAOnlineRuntime],
-        x_slices: Dict[str, torch.Tensor],
-        batch_indices: Tuple[int, int],
-    ) -> torch.Tensor:
-        """
-        Para um batch [start:end], executa a inferencia dos 4 previsores
-        e retorna um tensor de shape [B, 4] com as previsoes de cada timeframe.
-        Os tensores de entrada ja estao no device correto.
-        """
-        start, end = batch_indices
-        signals = []
-        for tf in self.TIMEFRAMES:
-            agent = predictors[tf]
-            bx = x_slices[tf][start:end]  # ja no device
-            pred = agent.predict(bx, raw_output=True)  # [B, 1]
-            signals.append(pred)
-        return torch.cat(signals, dim=1)  # [B, 4]
 
     # ------------------------------------------------------------------
     # Backtest principal
@@ -221,7 +268,10 @@ class SolanaMultiTFEngine:
 
         # 1. Carrega e alinha todos os timeframes
         print("\n[Carregamento] Alinhando 4 timeframes da SOL ao grid 15m...")
-        data = self.loader.load_multi_timeframe_sol(train_ratio=0.7)
+        data = self.loader.load_multi_timeframe_sol(
+            train_ratio=0.7,
+            max_samples=self.max_samples,
+        )
 
         X_train_15m, Y_train_15m, X_test_15m, Y_test_15m = data["15m"]
         features_15m = X_train_15m.shape[1]
@@ -265,47 +315,112 @@ class SolanaMultiTFEngine:
         trader = self._init_trader(features_count=trader_features)
 
         # ---------------------------------------------------------------
-        # FASE 1 -- Treino Online (Warm-up historico com 2 epocas)
+        # FASE 1-A -- Warm-up exclusivo dos Previsores (3 epocas)
+        # O trader so entra depois que os previsores tiverem sinal proprio.
         # ---------------------------------------------------------------
         print(f"\n{'-'*65}")
-        print(" [Fase 1] Treino Online Continuo (Simulando Vida Passada...)")
+        print(" [Fase 1-A] Warm-up dos 4 Previsores (sem trader)")
         print(f"{'-'*65}")
 
-        for ep in range(2):
-            ep_pnl_pred = {tf: 0.0 for tf in self.TIMEFRAMES}
-            ep_pnl_trade = 0.0
+        import time
+        PREDICTOR_WARMUP_EPOCHS = 3
+        for ep in range(PREDICTOR_WARMUP_EPOCHS):
+            ep_pnl_pred  = {tf: 0.0 for tf in self.TIMEFRAMES}
+            total_batches = (train_len + self.batch_size - 1) // self.batch_size
+            t_ep_start = time.time()
 
-            for i in range(0, train_len, self.batch_size):
+            for batch_idx, i in enumerate(range(0, train_len, self.batch_size)):
                 end_i = min(i + self.batch_size, train_len)
-
-                # --- Treina os 4 previsores no seu proprio target ---
                 for tf in self.TIMEFRAMES:
-                    bx = data_dev[tf][0][i:end_i]  # X_train no device
-                    by = data_dev[tf][1][i:end_i]  # Y_train no device
+                    bx = data_dev[tf][0][i:end_i]
+                    by = data_dev[tf][1][i:end_i]
                     res = predictors[tf].observe(bx, by)
                     pred_val = res.live_prediction.detach().squeeze(-1)
                     ep_pnl_pred[tf] += (pred_val * by[:pred_val.shape[0], 0]).sum().item()
 
-                # --- Constroi features do trader ---
-                predictor_signals = self._get_predictor_signals(
-                    predictors,
-                    x_slices={tf: data_dev[tf][0] for tf in self.TIMEFRAMES},
-                    batch_indices=(i, end_i),
-                )
-                # Concatena features 15m + 4 sinais dos previsores (tudo no device)
-                bx_15m  = X_train_15m[i:end_i]
-                by_15m  = Y_train_15m[i:end_i]
-                bx_trade = torch.cat([bx_15m, predictor_signals], dim=1)
+                if (batch_idx + 1) % self.report_every == 0 or (batch_idx + 1) == total_batches:
+                    pct     = 100.0 * (batch_idx + 1) / total_batches
+                    elapsed = time.time() - t_ep_start
+                    eta_s   = elapsed / (batch_idx + 1) * (total_batches - batch_idx - 1)
+                    pred_str = " | ".join(f"{tf}:{ep_pnl_pred[tf]:+.3f}" for tf in self.TIMEFRAMES)
+                    print(
+                        f"  WarmUp {ep+1}/{PREDICTOR_WARMUP_EPOCHS}"
+                        f" [{batch_idx+1:>{len(str(total_batches))}}/{total_batches}]"
+                        f" {pct:5.1f}%  ETA {eta_s:4.0f}s  [{pred_str}]",
+                        flush=True,
+                    )
 
-                # --- Treina o agente trader ---
-                res_trade = trader.observe(bx_trade, by_15m)
-                posicoes = torch.tanh(res_trade.live_prediction[:, 1:2]).detach()
-                ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
-
-            print(f"\n Epoca {ep+1}/2:")
+            print(f"\n  WarmUp {ep+1}/{PREDICTOR_WARMUP_EPOCHS} concluido em {time.time()-t_ep_start:.1f}s")
             for tf in self.TIMEFRAMES:
                 print(f"   T0_{tf} PnL Bruto: {ep_pnl_pred[tf]:+.4f}")
+
+        # ---------------------------------------------------------------
+        # FASE 1-B -- Treino do Trader com sinais normalizados (2 epocas)
+        # Os sinais dos previsores sao z-score normalizados intra-batch
+        # antes de entrar no trader, evitando que magnitudes minusculas
+        # (~0.005) sejam ignoradas pelo bias da rede.
+        # ---------------------------------------------------------------
+        print(f"\n{'-'*65}")
+        print(" [Fase 1-B] Treino do Trader (sinais normalizados)")
+        print(f"{'-'*65}")
+
+        # Normalizer EMA causal: cada batch usa estatisticas dos batches ANTERIORES
+        # Elimina o data leak do z-score intra-batch que usava amostras futuras do batch
+        sig_normalizer = EMASignalNormalizer(num_signals=len(self.TIMEFRAMES), decay=0.99)
+
+        TRADER_EPOCHS = 2
+        for ep in range(TRADER_EPOCHS):
+            # Reinicia o normalizer a cada epoca para estadisticas capazes de adaptar
+            # (o estado do EMA persiste entre epocas — nao resetamos aqui intencionalmente:
+            # a 2a epoca usa o EMA aquecido da 1a, que e mais estavel)
+            ep_pnl_trade = 0.0
+            total_batches = (train_len + self.batch_size - 1) // self.batch_size
+            t_ep_start = time.time()
+
+            for batch_idx, i in enumerate(range(0, train_len, self.batch_size)):
+                end_i = min(i + self.batch_size, train_len)
+
+                # Continua treinando previsores em paralelo e captura a previsao exata
+                # que acabou de ser feita (sem chamar predict() de novo para nao
+                # corromper o historico temporal com duplicatas)
+                signals = []
+                for tf in self.TIMEFRAMES:
+                    bx = data_dev[tf][0][i:end_i]
+                    by = data_dev[tf][1][i:end_i]
+                    res = predictors[tf].observe(bx, by)
+                    signals.append(res.live_prediction.detach())
+                
+                # Tensor [B, 4] com as previsoes dos 4 T0s
+                predictor_signals = torch.cat(signals, dim=1)
+                
+                # Normalizacao EMA causal: usa estatisticas dos batches anteriores
+                predictor_signals_norm = sig_normalizer.normalize(predictor_signals)
+
+                bx_15m   = X_train_15m[i:end_i]
+                by_15m   = Y_train_15m[i:end_i]
+                bx_trade = torch.cat([bx_15m, predictor_signals_norm], dim=1)
+
+                res_trade = trader.observe(bx_trade, by_15m)
+                posicoes  = torch.tanh(res_trade.live_prediction[:, 1:2]).detach()
+                ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
+
+                if (batch_idx + 1) % self.report_every == 0 or (batch_idx + 1) == total_batches:
+                    pct     = 100.0 * (batch_idx + 1) / total_batches
+                    elapsed = time.time() - t_ep_start
+                    eta_s   = elapsed / (batch_idx + 1) * (total_batches - batch_idx - 1)
+                    # Posicao media do batch para diagnostico
+                    pos_mean = float(posicoes.mean().item())
+                    print(
+                        f"  Trader Ep {ep+1}/{TRADER_EPOCHS}"
+                        f" [{batch_idx+1:>{len(str(total_batches))}}/{total_batches}]"
+                        f" {pct:5.1f}%  ETA {eta_s:4.0f}s"
+                        f"  PnL={ep_pnl_trade:+.4f}  pos_media={pos_mean:+.3f}",
+                        flush=True,
+                    )
+
+            print(f"\n  Trader Ep {ep+1}/{TRADER_EPOCHS} concluido em {time.time()-t_ep_start:.1f}s")
             print(f"   T0_trade PnL Bruto: {ep_pnl_trade:+.4f}")
+
 
         # ---------------------------------------------------------------
         # FASE 2 -- Hold-out cego (OOS Inference)
@@ -319,84 +434,283 @@ class SolanaMultiTFEngine:
             predictors[tf].model.eval()
         trader.model.eval()
 
-        all_positions: list[torch.Tensor] = []
-
+        print(" Executando predicoes OOS em uma unica passagem (para preservar cronologia da GRU)...")
         with torch.no_grad():
-            for i in range(0, test_len, 256):
-                end_i = min(i + 256, test_len)
+            # 1. Inferencia dos 4 previsores para todos os 6000 passos de uma vez.
+            # O predict() vai processar sequencialmente garantindo integridade da GRU.
+            signals = []
+            for tf in self.TIMEFRAMES:
+                bx_all = data_dev[tf][2]  # [test_len, features_dim]
+                pred = predictors[tf].predict(bx_all, raw_output=True)  # [test_len, 1]
+                signals.append(pred)
+            
+            pred_signals_oos = torch.cat(signals, dim=1)  # [test_len, 4]
+            
+            # Normalizacao com estado EMA congelado
+            pred_signals_norm_oos = sig_normalizer.normalize_frozen(pred_signals_oos)
 
-                # Inferencia dos 4 previsores (dados ja no device)
-                signals = []
-                for tf in self.TIMEFRAMES:
-                    bx = data_dev[tf][2][i:end_i]
-                    pred = predictors[tf].predict(bx, raw_output=True)  # [B, 1]
-                    signals.append(pred)
-                predictor_signals = torch.cat(signals, dim=1)  # [B, 4]
+            # 2. Inferencia do Trader (Step-by-step causal para calcular Surprisal e extrair Logs do Grafo)
+            bx_trade_oos = torch.cat([X_test_15m, pred_signals_norm_oos], dim=1)
+            by_trade_oos = Y_test_15m  # Usaremos para calcular a loss do step t-1 e alimentar o surprisal
+            
+            pred_trade_list = []
+            dna_list = []
+            temp_list = []
 
-                # Inferencia do trader
-                bx_15m   = X_test_15m[i:end_i]
-                bx_trade = torch.cat([bx_15m, predictor_signals], dim=1)
-                trade_pred = trader.predict(bx_trade, raw_output=True)
-                pos = torch.tanh(trade_pred[:, 1:2])  # posicao in (-1, 1)
-                all_positions.append(pos)
+            # Clonamos o history buffer do trader para nao sujar o estado de treino
+            temp_history = None
+            if trader.multi_scale_builder is not None and trader.history_buffer is not None:
+                temp_history = trader.history_buffer.clone()
 
-        # Consolida e move para CPU para metricas/plot
-        posicoes_teste = torch.cat(all_positions, dim=0).cpu()  # [test_len, 1]
-        Y_test_15m_cpu = Y_test_15m.cpu()
+            for i in range(test_len):
+                bx_single = bx_trade_oos[i:i+1]
+                
+                # Prepara o contexto multi-escala
+                if temp_history is None or trader.multi_scale_builder is None:
+                    context = trader.model.encode_context(bx_single)
+                else:
+                    temp_history.append(bx_single.squeeze(0))
+                    contexts, _ = trader.multi_scale_builder.prepare_contexts(
+                        temp_history, step=0, device=bx_single.device, dtype=bx_single.dtype,
+                    )
+                    context, _ = trader.multi_scale_builder.compose_context(
+                        contexts, step=0, device=bx_single.device, dtype=bx_single.dtype,
+                    )
+
+                # Surprisal Causal: Pânico baseado na loss do passo (i-1)
+                if i == 0:
+                    current_surprisal = 0.0
+                else:
+                    prev_pred = pred_trade_list[-1]
+                    prev_y = by_trade_oos[i-1:i]
+                    # Calcula a perda (TriplexTradingLoss) que o agente obteve na barra passada
+                    per_sample_loss = trader._per_sample_loss(prev_pred, prev_y)
+                    # Atualiza o estimador EMA e pega o Z-Score do Surprisal
+                    obs = trader.global_surprisal_estimator.observe(per_sample_loss)
+                    current_surprisal = float(obs.priority.mean().item())
+
+                # Constroi a politica usando o surprisal calculado
+                policy = trader.model.build_policy_from_context(
+                    context, surprisal=current_surprisal, use_exploration=False
+                )
+                # Executa o grafo com o DNA dinamico
+                pred, _ = trader.model.execute_policy(bx_single, policy, raw_output=True)
+                
+                pred_trade_list.append(pred)
+                dna_list.append(policy.edge_dnas.detach().cpu())
+                temp_list.append(policy.temperature.detach().cpu())
+
+            pred_trade_oos = torch.cat(pred_trade_list, dim=0)  # [test_len, 2]
+            dnas_oos = torch.cat(dna_list, dim=0)  # [test_len, num_edges, dna_dim]
+            temps_oos = torch.cat(temp_list, dim=0)  # [test_len, 1, 1]
+
+        pred_return_oos = pred_trade_oos[:, 0:1].cpu()  # [test_len, 1]
+        posicoes_teste  = torch.tanh(pred_trade_oos[:, 1:2]).cpu()  # [test_len, 1]
+        pred_signals_oos = pred_signals_oos.cpu()
+        Y_test_15m_cpu  = Y_test_15m.cpu()
 
         # ---------------------------------------------------------------
         # Metricas e Relatorio
         # ---------------------------------------------------------------
-        gross_pnl = posicoes_teste * Y_test_15m_cpu
-        pos_shift = torch.roll(posicoes_teste, shifts=1, dims=0)
-        pos_shift[0] = posicoes_teste[0]
-        custos = torch.abs(posicoes_teste - pos_shift) * 0.0005
-        net_return_stream = (gross_pnl - custos).view(-1).numpy()
-        bh_stream = Y_test_15m_cpu.view(-1).numpy()
+        pos_np    = posicoes_teste.view(-1).numpy()
+        ret_np    = Y_test_15m_cpu.view(-1).numpy()
+        gross_np  = pos_np * ret_np
 
-        agent_equity = net_return_stream.cumsum(axis=0)
-        bh_equity    = bh_stream.cumsum(axis=0)
+        pos_shift_np      = np.roll(pos_np, 1)
+        pos_shift_np[0]   = pos_np[0]
+        cost_np           = np.abs(pos_np - pos_shift_np) * 0.0005
+        net_return_stream = gross_np - cost_np
 
-        print(f"\n>>> DADOS DO OUT-OF-SAMPLE ({test_len} passos - 15m) <<<")
-        print(f"Baseline B&H Retorno Bruto Acumulado:    {bh_equity[-1]:+.4f}")
-        print(f"HSAMA Agente Retorno Liquido Acumulado:  {agent_equity[-1]:+.4f}")
+        agent_equity = net_return_stream.cumsum()
+        bh_equity    = ret_np.cumsum()
 
-        # Sharpe ratio anualizado (252 dias * 96 candles 15m/dia)
-        candles_per_year = 252 * 96
+        # Metricas adicionais
+        
+        # Discretiza a posicao para calcular numero REAL de trades
+        discrete_pos = np.zeros_like(pos_np)
+        discrete_pos[pos_np > 0.05] = 1.0
+        discrete_pos[pos_np < -0.05] = -1.0
+        
+        # Um trade real ocorre apenas quando a classe da acao muda (LONG/SHORT/FLAT)
+        pos_change = discrete_pos[1:] != discrete_pos[:-1]
+        n_trades = int(pos_change.sum())
+        avg_holding = test_len / max(n_trades, 1)
+        win_rate      = float((net_return_stream > 0).mean()) * 100
+        avg_win       = float(net_return_stream[net_return_stream > 0].mean()) if (net_return_stream > 0).any() else 0.0
+        avg_loss      = float(net_return_stream[net_return_stream < 0].mean()) if (net_return_stream < 0).any() else 0.0
+        correct_dir   = float(((pos_np > 0) == (ret_np > 0)).mean()) * 100
+
+        candles_per_year  = 252 * 96
+        sharpe = 0.0
         if net_return_stream.std() > 0:
             sharpe = (net_return_stream.mean() / net_return_stream.std()) * np.sqrt(candles_per_year)
-            print(f"Sharpe Ratio Anualizado (15m):           {sharpe:+.3f}")
 
+        # --- NOVAS METRICAS DE DEBUG DA ARQUITETURA ---
+        
+        # 1. Metricas dos Previsores (Acuracia Direcional e MSE)
+        pred_sig_np = pred_signals_oos.numpy()
+        tf_metrics = {}
+        for idx, tf in enumerate(self.TIMEFRAMES):
+            y_real = data_dev[tf][3].cpu().numpy().squeeze()  # [test_len]
+            y_pred = pred_sig_np[:, idx]
+            dir_acc = float(((y_pred > 0) == (y_real > 0)).mean()) * 100
+            mse = float(np.mean((y_pred - y_real)**2))
+            
+            # Correlacao com a decisao final do trader
+            corr_pos = float(np.corrcoef(y_pred, pos_np)[0, 1]) if np.std(y_pred) > 0 else 0.0
+            tf_metrics[tf] = {"acc": dir_acc, "mse": mse, "corr": corr_pos}
+
+        # 2. Critic Check (Retorno Esperado do Trader vs Posicao)
+        pred_ret_np = pred_return_oos.numpy().squeeze()
+        critic_corr = float(np.corrcoef(pred_ret_np, pos_np)[0, 1]) if np.std(pred_ret_np) > 0 else 0.0
+
+        # 2.5 Metricas do Grafo (Plasticidade e Regime)
+        dnas_oos_np = dnas_oos.numpy()
+        temps_oos_np = temps_oos.numpy().squeeze()
+        
+        dna_diffs = np.linalg.norm(dnas_oos_np[1:] - dnas_oos_np[:-1], axis=(1, 2))
+        avg_dna_volatility = float(np.mean(dna_diffs))
+        dna_sparsity = float(np.mean(np.abs(dnas_oos_np) < 0.01)) * 100
+        
+        avg_temp = float(np.mean(temps_oos_np))
+        max_temp = float(np.max(temps_oos_np))
+
+        # 3. Comportamento e Saturacao
+        long_pct = float((discrete_pos == 1.0).mean()) * 100
+        short_pct = float((discrete_pos == -1.0).mean()) * 100
+        flat_pct = float((discrete_pos == 0.0).mean()) * 100
+        mean_conf = float(np.abs(pos_np).mean())
+        
+        # 4. Atrito e Drawdown
+        total_gross = float(gross_np.sum())
+        total_costs = float(cost_np.sum())
+        friction_pct = (total_costs / total_gross * 100) if total_gross > 0 else float('inf')
+        
+        cum_max = np.maximum.accumulate(agent_equity)
+        max_dd = float(np.min(agent_equity - cum_max)) * 100  # aproximação em % para log-returns
+
+        # Print do relatorio turbinado
+        print(f"\n>>> METRICAS ESTRUTURAIS & DE ARQUITETURA <<<")
+        acc_str = " | ".join([f"{tf}: {tf_metrics[tf]['acc']:.1f}%" for tf in self.TIMEFRAMES])
+        print(f"[Sinais OOS] Acuracia Direcional: {acc_str}")
+        corr_str = " | ".join([f"{tf}: {tf_metrics[tf]['corr']:+.2f}" for tf in self.TIMEFRAMES])
+        print(f"[Atencao do Trader] Correlacao c/ Posicao: {corr_str}")
+        print(f"[Critic Check] Correlacao (Ret Previsto x Posicao): {critic_corr:+.2f}")
+        
+        print(f"\n>>> LOGS DO GRAFO & DETECCAO DE REGIME <<<")
+        print(f"Temperatura do Surprisal: Media = {avg_temp:.3f} | Max = {max_temp:.3f} (Pico de Panico)")
+        print(f"Plasticidade do DNA (Delta L2/passo): {avg_dna_volatility:.4f}")
+        print(f"Esparsidade Dinamica (Edge Pruning):  {dna_sparsity:.1f}% das arestas ~inativas")
+        
+        print(f"\n>>> COMPORTAMENTO DO AGENTE (Loss Diagnostics) <<<")
+        print(f"Distribuicao de Tempo:  LONG: {long_pct:.1f}% | SHORT: {short_pct:.1f}% | FLAT: {flat_pct:.1f}%")
+        print(f"Confianca Media (|tanh|): {mean_conf:.3f} (esperado 0.3 - 0.7)")
+        friction_str = f"{friction_pct:.1f}% do Gross PnL" if friction_pct != float('inf') else "S/A (Gross PnL Negativo)"
+        print(f"Atrito de Transacao:    Custos comeram {friction_str}")
+
+        print(f"\n>>> DADOS FINANCEIROS OUT-OF-SAMPLE ({test_len} passos - 15m) <<<")
+        print(f"Baseline B&H Retorno Bruto Acumulado:    {bh_equity[-1]:+.4f}")
+        print(f"HSAMA Agente Retorno Liquido Acumulado:  {agent_equity[-1]:+.4f}")
+        print(f"Sharpe Ratio Anualizado (15m):           {sharpe:+.3f}")
+        print(f"Max Drawdown:                            {max_dd:.1f}%")
+        print(f"Numero de Rebalanceamentos (Trades):     {n_trades}")
+        print(f"Holding medio (candles 15m):             {avg_holding:.1f}")
+        print(f"Win Rate (por passo):                    {win_rate:.1f}%")
+        print(f"Avg Win | Avg Loss:                      {avg_win:+.6f} | {avg_loss:+.6f}")
+
+        # ---------------------------------------------------------------
+        # CSV de Trades
+        # ---------------------------------------------------------------
+        os.makedirs("artifacts", exist_ok=True)
+
+        # Classificacao da acao por threshold
+        def _classify_action(p: float) -> str:
+            if   p >  0.05: return "LONG"
+            elif p < -0.05: return "SHORT"
+            else:           return "FLAT"
+
+        pred_sig_np = pred_signals_oos.numpy()  # [test_len, 4]
+
+        records = []
+        cumul = 0.0
+        for step in range(test_len):
+            pos_val    = float(pos_np[step])
+            ret_val    = float(ret_np[step])
+            gross_val  = float(gross_np[step])
+            cost_val   = float(cost_np[step])
+            net_val    = float(net_return_stream[step])
+            cumul     += net_val
+            pos_change = float(cost_np[step] / 0.0005) if cost_np[step] > 0 else 0.0  # |delta_pos|
+
+            records.append({
+                "step":              step,
+                "position":          round(pos_val, 6),
+                "action":            _classify_action(pos_val),
+                "position_change":   round(abs(pos_np[step] - pos_shift_np[step]), 6),
+                "pred_return":       round(float(pred_return_oos[step, 0]), 6),
+                "pred_15m":          round(float(pred_sig_np[step, 0]), 6),
+                "pred_1h":           round(float(pred_sig_np[step, 1]), 6),
+                "pred_4h":           round(float(pred_sig_np[step, 2]), 6),
+                "pred_1d":           round(float(pred_sig_np[step, 3]), 6),
+                "market_return":     round(ret_val,   6),
+                "gross_pnl":         round(gross_val, 6),
+                "cost":              round(cost_val,  6),
+                "net_pnl":           round(net_val,   6),
+                "cumul_net_pnl":     round(cumul,     6),
+                "correct_direction": int((pos_val > 0) == (ret_val > 0)),
+            })
+
+        df_trades = pd.DataFrame(records)
+        csv_path  = "artifacts/SOL_trades_oos.csv"
+        df_trades.to_csv(csv_path, index=False)
+        print(f"\nCSV de trades salvo em: {csv_path}  ({len(df_trades)} linhas)")
+
+        # ---------------------------------------------------------------
         # Grafico
+        # ---------------------------------------------------------------
         os.makedirs("artifacts/plots", exist_ok=True)
-        plt.figure(figsize=(14, 7))
+        fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
 
-        plt.subplot(2, 1, 1)
-        plt.plot(bh_equity,    label="Buy & Hold (Baseline)", color="gray",    alpha=0.7, linewidth=1.5)
-        plt.plot(agent_equity, label="HSAMA 5-T0 Trader",     color="#00c4ff", linewidth=2)
-        plt.title("SOL/USDT -- Equity Curve OOS | 4 T0s Previsao + 1 T0 Trade")
-        plt.ylabel("Retorno Cumulativo (Log)")
-        plt.legend()
-        plt.grid(True, alpha=0.25)
+        # Painel 1: Equity curves
+        axes[0].plot(bh_equity,    label="Buy & Hold (Baseline)", color="#aaaaaa", alpha=0.8, linewidth=1.2)
+        axes[0].plot(agent_equity, label="HSAMA 5-T0 Trader",     color="#00c4ff", linewidth=2)
+        axes[0].set_title("SOL/USDT -- Equity Curve OOS | 4 T0s Previsao + 1 T0 Trade")
+        axes[0].set_ylabel("Retorno Cumulativo (Log)")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.2)
 
-        plt.subplot(2, 1, 2)
-        plt.plot(posicoes_teste.numpy(), color="#ff7a00", linewidth=0.8, alpha=0.8)
-        plt.axhline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.4)
-        plt.title("Posicao do Agente Trader ao longo do OOS")
-        plt.ylabel("Posicao (-1=Short, +1=Long)")
-        plt.xlabel("Passos de 15m")
-        plt.grid(True, alpha=0.25)
+        # Painel 2: Posicao contínua + coloracao de acoes
+        axes[1].plot(pos_np, color="#ff7a00", linewidth=0.7, alpha=0.85)
+        axes[1].axhline( 0.05, color="green", linewidth=0.5, linestyle="--", alpha=0.5)
+        axes[1].axhline(-0.05, color="red",   linewidth=0.5, linestyle="--", alpha=0.5)
+        axes[1].axhline( 0,    color="white", linewidth=0.4, linestyle=":",  alpha=0.3)
+        axes[1].set_title("Posicao do Agente (dashed: thresholds LONG/SHORT +/-0.02)")
+        axes[1].set_ylabel("Posicao [-1, 1]")
+        axes[1].grid(True, alpha=0.2)
+
+        # Painel 3: Sinais dos 4 previsores
+        colors_tf = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373"]
+        for idx, tf in enumerate(self.TIMEFRAMES):
+            axes[2].plot(pred_sig_np[:, idx], label=f"T0_{tf}",
+                         color=colors_tf[idx], linewidth=0.7, alpha=0.75)
+        axes[2].axhline(0, color="white", linewidth=0.4, linestyle=":", alpha=0.3)
+        axes[2].set_title("Sinais dos 4 T0s de Previsao (retorno previsto, raw)")
+        axes[2].set_ylabel("Pred. Retorno")
+        axes[2].set_xlabel("Passos de 15m (OOS)")
+        axes[2].legend(loc="upper right", fontsize=8)
+        axes[2].grid(True, alpha=0.2)
 
         plt.tight_layout()
         plot_path = "artifacts/plots/SOL_multitf_equity.png"
         plt.savefig(plot_path, dpi=150)
         plt.close()
-        print(f"\nGrafico salvo em: {plot_path}")
+        print(f"Grafico salvo em: {plot_path}")
 
         return {
             "agent_equity": agent_equity,
             "bh_equity":    bh_equity,
             "net_returns":  net_return_stream,
+            "trades_df":    df_trades,
         }
 
 
