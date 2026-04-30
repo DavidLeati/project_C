@@ -111,6 +111,8 @@ class HSAMA(nn.Module):
         hop_scale_init=1.0,
         rewire_prob=0.1,
         pade_eps=1e-4,
+        output_scale_init=None,
+        learnable_output_scale=False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -187,7 +189,32 @@ class HSAMA(nn.Module):
         )
 
         self.output_layer = nn.Linear(state_dim, out_features)
+        if output_scale_init is None:
+            self.output_log_scale = None
+        else:
+            scale = torch.as_tensor(output_scale_init, dtype=torch.float32)
+            if scale.ndim == 0:
+                scale = scale.expand(out_features).clone()
+            if scale.shape != (out_features,):
+                raise ValueError(
+                    "output_scale_init deve ser escalar ou ter formato (out_features,)."
+                )
+            if torch.any(scale <= 0):
+                raise ValueError("output_scale_init deve conter apenas valores positivos.")
+            log_scale = scale.log()
+            if learnable_output_scale:
+                self.output_log_scale = nn.Parameter(log_scale)
+            else:
+                self.register_buffer("output_log_scale", log_scale)
         self.rms_norm = RMSNorm(state_dim)
+
+    def _apply_output_scale(self, raw_state):
+        if self.output_log_scale is None:
+            return raw_state
+        return raw_state * self.output_log_scale.exp().to(
+            device=raw_state.device,
+            dtype=raw_state.dtype,
+        )
 
     @staticmethod
     def _dedupe_parameters(parameters):
@@ -460,7 +487,7 @@ class HSAMA(nn.Module):
                 node_states = node_states + (self.hop_scale * new_states)
 
                 mean_state = node_states.mean(dim=1)
-                raw_state = self.output_layer(mean_state)
+                raw_state = self._apply_output_scale(self.output_layer(mean_state))
                 hop_global = raw_state if raw_output else F.softplus(raw_state)
                 hop_proj = self.projection_head(mean_state)
                 hop_predictions.append((hop_global, hop_proj))
@@ -471,7 +498,7 @@ class HSAMA(nn.Module):
             return hop_predictions
 
         mean_state = node_states.mean(dim=1)
-        raw_state = self.output_layer(mean_state)
+        raw_state = self._apply_output_scale(self.output_layer(mean_state))
         global_state = raw_state if raw_output else F.softplus(raw_state)
         projected_state = self.projection_head(mean_state)
         return global_state, projected_state

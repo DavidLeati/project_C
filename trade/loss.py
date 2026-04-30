@@ -2,6 +2,16 @@ import torch
 import torch.nn.functional as F
 
 
+def position_from_logits(logits: torch.Tensor, deadzone: float = 0.05) -> torch.Tensor:
+    """Mapeia logits para posicao e zera exposicao pequena para evitar giro em ruido."""
+    raw_position = torch.tanh(logits)
+    if deadzone <= 0.0:
+        return raw_position
+    abs_position = raw_position.abs()
+    active = F.relu(abs_position - deadzone) / (1.0 - deadzone)
+    return raw_position.sign() * active
+
+
 class TriplexTradingLoss:
     """
     Funcao Multi-Objetivo (Actor-Critic Style) para a Rede HSAMA de Trade.
@@ -25,17 +35,19 @@ class TriplexTradingLoss:
 
     def __init__(
         self,
-        cost_bps: float       = 0.0005,
-        trade_weight: float   = 10.0,   # Restaurado: PnL precisa de peso maior
+        cost_bps: float       = 0.0010,   # "Pesos no tornozelo": treina com custo dobrado (10bps) para filtrar ruido
+        trade_weight: float   = 50.0,     # Mantido alto para priorizar PnL real
         return_scale: float   = 100.0,
         entropy_weight: float = 0.05,
-        bias_weight: float    = 2.0,    # Mantido: previne colapso direcional
+        bias_weight: float    = 0.2,      # Mantido baixo para permitir surfar tendencias
+        position_deadzone: float = 0.05,
     ):
         self.cost_bps       = cost_bps
         self.trade_weight   = trade_weight
         self.return_scale   = return_scale
         self.entropy_weight = entropy_weight
         self.bias_weight    = bias_weight
+        self.position_deadzone = float(position_deadzone)
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -45,7 +57,7 @@ class TriplexTradingLoss:
         pred_return = preds[:, 0:1]
         loss_mse = F.mse_loss(pred_return, targets, reduction="none")  # [B, 1]
 
-        position = torch.tanh(preds[:, 1:2])  # [-1, +1]
+        position = position_from_logits(preds[:, 1:2], deadzone=self.position_deadzone)  # [-1, +1]
 
         scaled_targets = targets * self.return_scale
         gross_pnl = position * scaled_targets

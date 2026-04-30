@@ -141,19 +141,15 @@ class CryptoDataLoader:
         # 2. Usa o indice 15m como ancora temporal de referencia
         anchor_index = raw_dfs["15m"].index
 
-        # 3. Para cada timeframe >15m, re-indexa ao grid de 15m usando ffill
-        aligned_dfs: Dict[str, pd.DataFrame] = {"15m": raw_dfs["15m"].copy()}
-        for tf in ["1h", "4h", "1d"]:
-            df_tf       = raw_dfs[tf]
-            df_reindexed = df_tf.reindex(anchor_index)
-            df_reindexed = df_reindexed.ffill()
-            df_reindexed = df_reindexed.bfill()
-            aligned_dfs[tf] = df_reindexed
+        feature_results: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        min_length = None
 
-        # 4. Carrega BTC e ETH para cada timeframe e injeta como colunas extras
+        # 3. Processa cada timeframe no seu ritmo nativo, depois reindexa
         for tf in ["15m", "1h", "4h", "1d"]:
-            df_sol = aligned_dfs[tf]
+            df_tf = raw_dfs[tf].copy()
+            builder = self._builders[tf]
 
+            # 4. Injeta BTC e ETH no timeframe nativo
             for symbol, col_name in [("BTCUSDT", "btc_close"), ("ETHUSDT", "eth_close")]:
                 df_ext = self._try_load(symbol, tf)
                 if df_ext is not None:
@@ -161,32 +157,30 @@ class CryptoDataLoader:
                     df_ext = df_ext.set_index("open_time")[["close"]].rename(
                         columns={"close": col_name}
                     )
-                    if tf == "15m":
-                        # Alinhamento direto por indice
-                        df_sol = df_sol.join(df_ext, how="left")
-                    else:
-                        # Para TFs maiores: o df_sol ja esta no grid 15m,
-                        # entao reindexamos o externo ao grid 15m via ffill
-                        df_ext_aligned = df_ext.reindex(anchor_index).ffill().bfill()
-                        df_sol = df_sol.join(df_ext_aligned, how="left")
+                    df_tf = df_tf.join(df_ext, how="left")
                 else:
                     print(f"[{symbol}/{tf}] Arquivo nao encontrado — usando fallback zero para {col_name}")
 
-            aligned_dfs[tf] = df_sol
+            # 5. Processa features no ritmo nativo (Garante target e momentum corretos)
+            print(f"[SOL/{tf}] Processando Features nativas (Z-Score Rolling EMA)...")
+            df_tf = df_tf.reset_index(drop=False)
+            df_feats = builder.build_features_df(df_tf)
 
-        # 5. Processa features em cada timeframe
-        feature_results: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        min_length = None
-        for tf, builder in self._builders.items():
-            print(f"[SOL/{tf}] Processando Features (Z-Score Rolling EMA)...")
-            df_aligned = aligned_dfs[tf].reset_index(drop=False)
-            # Garante que open_time e coluna (para sessao UTC)
-            if "open_time" in df_aligned.columns:
-                df_aligned = df_aligned.rename(columns={"open_time": "open_time"})
-            X, Y = builder.transform(df_aligned)
-            feature_results[tf] = (X, Y)
-            if min_length is None or X.shape[0] < min_length:
-                min_length = X.shape[0]
+            # 6. Alinha (Forward-fill) as features prontas para o grid de 15m
+            if tf != "15m":
+                print(f"[SOL/{tf}] Projetando matriz de features para o grid 15m...")
+            df_feats = df_feats.set_index("open_time")
+            df_aligned = df_feats.reindex(anchor_index).ffill().bfill()
+
+            X = df_aligned[builder.FEATURE_COLS].values
+            Y = df_aligned[["target_return"]].values
+            
+            X_t = torch.tensor(X, dtype=torch.float32)
+            Y_t = torch.tensor(Y, dtype=torch.float32)
+
+            feature_results[tf] = (X_t, Y_t)
+            if min_length is None or X_t.shape[0] < min_length:
+                min_length = X_t.shape[0]
 
         # 6. Aplica max_samples: pega os ULTIMOS N apos alinhamento minimo
         effective_len = min(min_length, max_samples) if max_samples is not None else min_length

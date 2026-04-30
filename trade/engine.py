@@ -34,10 +34,40 @@ from src.runtime.multiscale import MultiScaleT0Config, T0ScaleSpec
 # Imports do pacote trade -- suportam execucao direta e como modulo
 try:
     from .dataset import CryptoDataLoader
-    from .loss import TriplexTradingLoss
+    from .loss import TriplexTradingLoss, position_from_logits
 except ImportError:
     from trade.dataset import CryptoDataLoader  # type: ignore[no-redef]
-    from trade.loss import TriplexTradingLoss    # type: ignore[no-redef]
+    from trade.loss import TriplexTradingLoss, position_from_logits    # type: ignore[no-redef]
+
+
+PREDICTOR_SIGMA_FLOOR = 1e-4
+PREDICTOR_SIGMA_OFFSET = 8.0
+PREDICTOR_EDGE_CLIP = 5.0
+TRADER_POSITION_DEADZONE = 0.05
+
+
+def _predictor_mu_sigma(preds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Converte saida do previsor em retorno esperado e volatilidade positiva."""
+    mu = preds[:, 0:1]
+    sigma = F.softplus(preds[:, 1:2] - PREDICTOR_SIGMA_OFFSET) + PREDICTOR_SIGMA_FLOOR
+    return mu, sigma
+
+
+def _predictor_probabilistic_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    mu, sigma = _predictor_mu_sigma(preds)
+    standardized_error = ((targets - mu) / sigma).pow(2)
+    calibration_penalty = torch.log(sigma / PREDICTOR_SIGMA_FLOOR)
+    return (0.5 * standardized_error + calibration_penalty).reshape(preds.size(0), -1).mean(dim=1)
+
+
+def _build_trade_signal_features(predictions: list[torch.Tensor]) -> torch.Tensor:
+    """Empacota [mu, sigma, mu/sigma] por timeframe para o trader."""
+    features = []
+    for pred in predictions:
+        mu, sigma = _predictor_mu_sigma(pred)
+        edge = (mu / sigma).clamp(-PREDICTOR_EDGE_CLIP, PREDICTOR_EDGE_CLIP)
+        features.extend((mu, sigma, edge))
+    return torch.cat(features, dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +207,8 @@ class SolanaMultiTFEngine:
     def __init__(self, data_dir: str = "trade/data"):
         self.loader = CryptoDataLoader(data_dir=data_dir)
         self.batch_size   = 32
-        self.max_samples  = 20_000   # ultimos N passos 15m usados para treino+teste
-        self.report_every = 100      # imprime progresso a cada N batches
+        self.max_samples  = 20_000   # Voltando para amostra pequena para iteracao rapida
+        self.report_every = 100      # Mais feedback no terminal
 
         # Device auto-detect
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -194,7 +224,7 @@ class SolanaMultiTFEngine:
         """Inicializa um agente previsor para um timeframe especifico."""
         model = HSAMA(
             in_features=features_count,
-            out_features=1,       # preve 1 valor: log-retorno do proximo candle
+            out_features=2,       # [retorno_esperado, volatilidade_esperada_bruta]
             num_nodes=8,
             state_dim=16,
             max_hops=1,
@@ -211,10 +241,7 @@ class SolanaMultiTFEngine:
             multi_scale_t0_config=_make_predictor_config(tf),
         )
         runtime = HSAMAOnlineRuntime(model, config=config)
-        # Previsores usam MSE puro (sem custo de transacao)
-        runtime._per_sample_loss = lambda preds, targets: F.mse_loss(
-            preds, targets, reduction="none"
-        ).reshape(preds.size(0), -1).mean(dim=1)
+        runtime._per_sample_loss = _predictor_probabilistic_loss
 
         # Move para GPU
         _move_runtime_to_device(runtime, self.device)
@@ -232,6 +259,8 @@ class SolanaMultiTFEngine:
             state_dim=16,
             max_hops=1,
             context_dim=16,
+            output_scale_init=(1.0, 8.0),
+            learnable_output_scale=True,
         )
         config = HSAMARuntimeConfig(
             observe_mode="batch",
@@ -250,6 +279,7 @@ class SolanaMultiTFEngine:
             return_scale=100.0,
             entropy_weight=0.05,
             bias_weight=2.0,
+            position_deadzone=TRADER_POSITION_DEADZONE,
         )
 
         # Move para GPU
@@ -309,8 +339,9 @@ class SolanaMultiTFEngine:
             print(f"   T0_{tf} -> in_features={X_tr.shape[1]}")
 
         # 3. Inicializa o agente trader
-        #    in_features = features_15m + 4 sinais dos previsores
-        trader_features = features_15m + len(self.TIMEFRAMES)
+        #    in_features = features_15m + 12 sinais dos previsores: mu, sigma e edge por timeframe
+        predictor_signal_features = len(self.TIMEFRAMES) * 3
+        trader_features = features_15m + predictor_signal_features
         print(f"\n[Init] Criando T0_trade (in_features={trader_features})...")
         trader = self._init_trader(features_count=trader_features)
 
@@ -323,7 +354,7 @@ class SolanaMultiTFEngine:
         print(f"{'-'*65}")
 
         import time
-        PREDICTOR_WARMUP_EPOCHS = 3
+        PREDICTOR_WARMUP_EPOCHS = 5
         for ep in range(PREDICTOR_WARMUP_EPOCHS):
             ep_pnl_pred  = {tf: 0.0 for tf in self.TIMEFRAMES}
             total_batches = (train_len + self.batch_size - 1) // self.batch_size
@@ -335,7 +366,8 @@ class SolanaMultiTFEngine:
                     bx = data_dev[tf][0][i:end_i]
                     by = data_dev[tf][1][i:end_i]
                     res = predictors[tf].observe(bx, by)
-                    pred_val = res.live_prediction.detach().squeeze(-1)
+                    pred_mu, _ = _predictor_mu_sigma(res.live_prediction.detach())
+                    pred_val = pred_mu.squeeze(-1)
                     ep_pnl_pred[tf] += (pred_val * by[:pred_val.shape[0], 0]).sum().item()
 
                 if (batch_idx + 1) % self.report_every == 0 or (batch_idx + 1) == total_batches:
@@ -366,9 +398,9 @@ class SolanaMultiTFEngine:
 
         # Normalizer EMA causal: cada batch usa estatisticas dos batches ANTERIORES
         # Elimina o data leak do z-score intra-batch que usava amostras futuras do batch
-        sig_normalizer = EMASignalNormalizer(num_signals=len(self.TIMEFRAMES), decay=0.99)
+        sig_normalizer = EMASignalNormalizer(num_signals=predictor_signal_features, decay=0.99)
 
-        TRADER_EPOCHS = 2
+        TRADER_EPOCHS = 5
         for ep in range(TRADER_EPOCHS):
             # Reinicia o normalizer a cada epoca para estadisticas capazes de adaptar
             # (o estado do EMA persiste entre epocas — nao resetamos aqui intencionalmente:
@@ -390,8 +422,8 @@ class SolanaMultiTFEngine:
                     res = predictors[tf].observe(bx, by)
                     signals.append(res.live_prediction.detach())
                 
-                # Tensor [B, 4] com as previsoes dos 4 T0s
-                predictor_signals = torch.cat(signals, dim=1)
+                # Tensor [B, 12] com mu, sigma e edge ajustado por risco dos 4 T0s
+                predictor_signals = _build_trade_signal_features(signals)
                 
                 # Normalizacao EMA causal: usa estatisticas dos batches anteriores
                 predictor_signals_norm = sig_normalizer.normalize(predictor_signals)
@@ -401,7 +433,10 @@ class SolanaMultiTFEngine:
                 bx_trade = torch.cat([bx_15m, predictor_signals_norm], dim=1)
 
                 res_trade = trader.observe(bx_trade, by_15m)
-                posicoes  = torch.tanh(res_trade.live_prediction[:, 1:2]).detach()
+                posicoes  = position_from_logits(
+                    res_trade.live_prediction[:, 1:2],
+                    deadzone=TRADER_POSITION_DEADZONE,
+                ).detach()
                 ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
 
                 if (batch_idx + 1) % self.report_every == 0 or (batch_idx + 1) == total_batches:
@@ -441,10 +476,10 @@ class SolanaMultiTFEngine:
             signals = []
             for tf in self.TIMEFRAMES:
                 bx_all = data_dev[tf][2]  # [test_len, features_dim]
-                pred = predictors[tf].predict(bx_all, raw_output=True)  # [test_len, 1]
+                pred = predictors[tf].predict(bx_all, raw_output=True)  # [test_len, 2]
                 signals.append(pred)
             
-            pred_signals_oos = torch.cat(signals, dim=1)  # [test_len, 4]
+            pred_signals_oos = _build_trade_signal_features(signals)  # [test_len, 12]
             
             # Normalizacao com estado EMA congelado
             pred_signals_norm_oos = sig_normalizer.normalize_frozen(pred_signals_oos)
@@ -505,7 +540,10 @@ class SolanaMultiTFEngine:
             temps_oos = torch.cat(temp_list, dim=0)  # [test_len, 1, 1]
 
         pred_return_oos = pred_trade_oos[:, 0:1].cpu()  # [test_len, 1]
-        posicoes_teste  = torch.tanh(pred_trade_oos[:, 1:2]).cpu()  # [test_len, 1]
+        posicoes_teste  = position_from_logits(
+            pred_trade_oos[:, 1:2],
+            deadzone=TRADER_POSITION_DEADZONE,
+        ).cpu()  # [test_len, 1]
         pred_signals_oos = pred_signals_oos.cpu()
         Y_test_15m_cpu  = Y_test_15m.cpu()
 
@@ -547,18 +585,26 @@ class SolanaMultiTFEngine:
 
         # --- NOVAS METRICAS DE DEBUG DA ARQUITETURA ---
         
-        # 1. Metricas dos Previsores (Acuracia Direcional e MSE)
+        # 1. Metricas dos Previsores (Acuracia Direcional, MSE e incerteza)
         pred_sig_np = pred_signals_oos.numpy()
         tf_metrics = {}
         for idx, tf in enumerate(self.TIMEFRAMES):
             y_real = data_dev[tf][3].cpu().numpy().squeeze()  # [test_len]
-            y_pred = pred_sig_np[:, idx]
+            base_col = idx * 3
+            y_pred = pred_sig_np[:, base_col]
+            y_sigma = pred_sig_np[:, base_col + 1]
+            y_edge = pred_sig_np[:, base_col + 2]
             dir_acc = float(((y_pred > 0) == (y_real > 0)).mean()) * 100
             mse = float(np.mean((y_pred - y_real)**2))
             
             # Correlacao com a decisao final do trader
-            corr_pos = float(np.corrcoef(y_pred, pos_np)[0, 1]) if np.std(y_pred) > 0 else 0.0
-            tf_metrics[tf] = {"acc": dir_acc, "mse": mse, "corr": corr_pos}
+            corr_pos = float(np.corrcoef(y_edge, pos_np)[0, 1]) if np.std(y_edge) > 0 else 0.0
+            tf_metrics[tf] = {
+                "acc": dir_acc,
+                "mse": mse,
+                "corr": corr_pos,
+                "sigma": float(np.mean(y_sigma)),
+            }
 
         # 2. Critic Check (Retorno Esperado do Trader vs Posicao)
         pred_ret_np = pred_return_oos.numpy().squeeze()
@@ -594,7 +640,9 @@ class SolanaMultiTFEngine:
         acc_str = " | ".join([f"{tf}: {tf_metrics[tf]['acc']:.1f}%" for tf in self.TIMEFRAMES])
         print(f"[Sinais OOS] Acuracia Direcional: {acc_str}")
         corr_str = " | ".join([f"{tf}: {tf_metrics[tf]['corr']:+.2f}" for tf in self.TIMEFRAMES])
-        print(f"[Atencao do Trader] Correlacao c/ Posicao: {corr_str}")
+        sigma_str = " | ".join([f"{tf}: {tf_metrics[tf]['sigma']:.5f}" for tf in self.TIMEFRAMES])
+        print(f"[Volatilidade Prevista] Media: {sigma_str}")
+        print(f"[Atencao do Trader] Correlacao Edge(mu/sigma) c/ Posicao: {corr_str}")
         print(f"[Critic Check] Correlacao (Ret Previsto x Posicao): {critic_corr:+.2f}")
         
         print(f"\n>>> LOGS DO GRAFO & DETECCAO DE REGIME <<<")
@@ -629,7 +677,7 @@ class SolanaMultiTFEngine:
             elif p < -0.05: return "SHORT"
             else:           return "FLAT"
 
-        pred_sig_np = pred_signals_oos.numpy()  # [test_len, 4]
+        pred_sig_np = pred_signals_oos.numpy()  # [test_len, 12] -> mu, sigma, edge por timeframe
 
         records = []
         cumul = 0.0
@@ -649,9 +697,17 @@ class SolanaMultiTFEngine:
                 "position_change":   round(abs(pos_np[step] - pos_shift_np[step]), 6),
                 "pred_return":       round(float(pred_return_oos[step, 0]), 6),
                 "pred_15m":          round(float(pred_sig_np[step, 0]), 6),
-                "pred_1h":           round(float(pred_sig_np[step, 1]), 6),
-                "pred_4h":           round(float(pred_sig_np[step, 2]), 6),
-                "pred_1d":           round(float(pred_sig_np[step, 3]), 6),
+                "vol_15m":           round(float(pred_sig_np[step, 1]), 6),
+                "edge_15m":          round(float(pred_sig_np[step, 2]), 6),
+                "pred_1h":           round(float(pred_sig_np[step, 3]), 6),
+                "vol_1h":            round(float(pred_sig_np[step, 4]), 6),
+                "edge_1h":           round(float(pred_sig_np[step, 5]), 6),
+                "pred_4h":           round(float(pred_sig_np[step, 6]), 6),
+                "vol_4h":            round(float(pred_sig_np[step, 7]), 6),
+                "edge_4h":           round(float(pred_sig_np[step, 8]), 6),
+                "pred_1d":           round(float(pred_sig_np[step, 9]), 6),
+                "vol_1d":            round(float(pred_sig_np[step, 10]), 6),
+                "edge_1d":           round(float(pred_sig_np[step, 11]), 6),
                 "market_return":     round(ret_val,   6),
                 "gross_pnl":         round(gross_val, 6),
                 "cost":              round(cost_val,  6),
@@ -691,11 +747,11 @@ class SolanaMultiTFEngine:
         # Painel 3: Sinais dos 4 previsores
         colors_tf = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373"]
         for idx, tf in enumerate(self.TIMEFRAMES):
-            axes[2].plot(pred_sig_np[:, idx], label=f"T0_{tf}",
+            axes[2].plot(pred_sig_np[:, idx * 3 + 2], label=f"T0_{tf}",
                          color=colors_tf[idx], linewidth=0.7, alpha=0.75)
         axes[2].axhline(0, color="white", linewidth=0.4, linestyle=":", alpha=0.3)
-        axes[2].set_title("Sinais dos 4 T0s de Previsao (retorno previsto, raw)")
-        axes[2].set_ylabel("Pred. Retorno")
+        axes[2].set_title("Sinais dos 4 T0s de Previsao (edge = retorno / volatilidade)")
+        axes[2].set_ylabel("Edge Ajustado")
         axes[2].set_xlabel("Passos de 15m (OOS)")
         axes[2].legend(loc="upper right", fontsize=8)
         axes[2].grid(True, alpha=0.2)

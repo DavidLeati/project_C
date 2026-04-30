@@ -312,7 +312,7 @@ class HSAMAOnlineRuntime:
         porque o contexto T0 resume o *histórico visto até agora*.
         """
         if self.multi_scale_builder is None:
-            # Each sample gets an independent context — full fidelity.
+            # Cada amostra recebe um contexto independente — fidelidade total.
             context = self.model.encode_context(x_batch)  # [B, context_dim]
             return context, {}, [], {}
 
@@ -480,15 +480,15 @@ class HSAMAOnlineRuntime:
         batch_size = x_live.size(0)
         step = self.global_step
 
-        # --- Context & T0 policy ---
+        # --- Contexto e política T0 ---
         context, contexts, due_scale_names, scale_metadata = self._prepare_context_batch(
             x_live, step=step
         )
-        # Collapse the per-sample contexts to a single representative context
-        # so that the resulting policy (edge_dnas shape [1, E, D]) can be
-        # expanded by _expand_policy to cover the full live+replay batch.
-        # For the simple encoder this is the mean of per-sample encodings;
-        # for the multi-scale builder context is already [1, D] (shared).
+        # Colapsa os contextos por amostra em um único contexto representativo
+        # para que a política resultante (edge_dnas formato [1, E, D]) possa ser
+        # expandida por _expand_policy para cobrir o lote completo (vivo + replay).
+        # Para o codificador simples, esta é a média das codificações por amostra;
+        # para o construtor multi-escala, o contexto já é [1, D] (compartilhado).
         context_for_policy = context.mean(dim=0, keepdim=True)  # [1, context_dim]
         global_surprisal = self.global_surprisal_estimator.current(
             batch_size=1,
@@ -501,12 +501,12 @@ class HSAMAOnlineRuntime:
             use_exploration=self.config.use_exploration,
         )
 
-        # --- Combine live batch with replay samples ---
+        # --- Combina o lote vivo com amostras de replay ---
         train_x, train_y, sample_weight, train_policy, replay_size, replay_batch = self._build_training_batch(
             x_live, y_live, policy
         )
 
-        # --- Single forward + backward + optimizer step ---
+        # --- Passo único de forward + backward + otimizador ---
         self._zero_all_gradients()
         batch_prediction, batch_projection = self.model.execute_policy(
             train_x, train_policy, raw_output=self.config.raw_output
@@ -539,7 +539,7 @@ class HSAMAOnlineRuntime:
                 contexts, due_scale_names=due_scale_names, step=step
             )
 
-        # --- Surprisal update (live samples only, no replay rows) ---
+        # --- Atualização de surprisal (apenas amostras vivas, sem linhas de replay) ---
         live_loss = per_sample_loss[:batch_size].detach()
         global_observation = self.global_surprisal_estimator.observe(live_loss)
 
@@ -548,7 +548,6 @@ class HSAMAOnlineRuntime:
                 due_scale_names, losses=live_loss, step=step
             )
 
-        # --- Buffer insertion (bypass lag queue; insert live samples directly) ---
         buffer_inserted = False
         if self.replay_buffer is not None and global_observation.ready:
             priority_value = float(global_observation.priority.mean().item())

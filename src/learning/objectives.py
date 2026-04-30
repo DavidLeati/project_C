@@ -238,7 +238,7 @@ def _tail_samples_from_threshold(
     tail_mask   = (abs_targets >= threshold).float()   # [B]
 
     squared_err = (pred_flat - tgt_flat).pow(2)        # [B]
-    per_sample  = squared_err * tail_mask               # [B]: 0 for non-tail
+    per_sample  = squared_err * tail_mask               # [B]: 0 para amostras que não são de cauda (non-tail)
 
     if regime_multiplier is not None:
         per_sample = per_sample * regime_multiplier
@@ -279,7 +279,7 @@ def _drawdown_proxy_samples(
     tgt_flat  = targets.flatten(start_dim=1).mean(dim=1)     if targets.dim() > 1    else targets.squeeze(-1)
 
     negative_mask = (tgt_flat < 0).float()                   # [B]
-    exposure      = (pred_flat * negative_mask).clamp(min=0.0)  # positive = bad
+    exposure      = (pred_flat * negative_mask).clamp(min=0.0)  # positivo = ruim (bad)
     return exposure   # [B]
 
 
@@ -571,11 +571,11 @@ class TradingCompositeObjective(BaseMetaObjective):
         device = predictions.device
         dtype  = predictions.dtype
 
-        # --- Resolve metadata ---------------------------------------------------
+        # --- Resolver metadados ---------------------------------------------------
         sample_weight    = _resolve_sample_weight(metadata, B, device, dtype)
         regime_multiplier = _resolve_regime_multiplier(metadata, B, device, dtype)
 
-        # --- 1. Per-sample raw components [B] ----------------------------------
+        # --- 1. Componentes brutos por amostra [B] ----------------------------------
         raw_dir  = _directional_samples(predictions, targets, self.directional_temperature, self.eps)
         abs_targets = targets.flatten(start_dim=1).mean(dim=1).abs() if targets.dim() > 1 else targets.squeeze(-1).abs()
         tail_threshold = self._tail_threshold(abs_targets)
@@ -588,8 +588,8 @@ class TradingCompositeObjective(BaseMetaObjective):
         raw_draw = _drawdown_proxy_samples(predictions, targets)
         self._observe_tail_batch(abs_targets)
 
-        # --- 2. Normalise over batch dimension (where B > 1) -------------------
-        # _safe_normalize requires at least 2 samples to be meaningful
+        # --- 2. Normalizar sobre a dimensão do lote (onde B > 1) -------------------
+        # _safe_normalize requer pelo menos 2 amostras para ser significativo
         if B > 1:
             norm_dir  = _safe_normalize(raw_dir,  self.eps)
             norm_tail = _safe_normalize(raw_tail, self.eps)
@@ -597,17 +597,17 @@ class TradingCompositeObjective(BaseMetaObjective):
         else:
             norm_dir, norm_tail, norm_draw = raw_dir, raw_tail, raw_draw
 
-        # --- 3. Clip each normalised component ---------------------------------
+        # --- 3. Limitar (clip) cada componente normalizado -------------------------
         dir_term  = self._clip(norm_dir)
         tail_term = self._clip(norm_tail)
         draw_term = self._clip(norm_draw)
 
-        # --- 4. Weighted reduction to scalar (respects sample_weight) ----------
+        # --- 4. Redução ponderada para escalar (respeita sample_weight) ----------
         dir_scalar  = _weighted_mean(dir_term,  sample_weight)
         tail_scalar = _weighted_mean(tail_term, sample_weight)
         draw_scalar = _weighted_mean(draw_term, sample_weight)
 
-        # --- 5. Blend with explicit term weights --------------------------------
+        # --- 5. Mistura com pesos de termo explícitos --------------------------------
         total = (
             self.weight_directional    * dir_scalar
             + self.weight_tail         * tail_scalar

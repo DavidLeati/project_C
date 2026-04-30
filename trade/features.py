@@ -104,19 +104,9 @@ class CryptoFeatureBuilder:
     # API publica
     # ------------------------------------------------------------------
 
-    def transform(self, df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor]:
+    def build_features_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Recebe DataFrame com colunas minimas [open, high, low, close, volume].
-
-        Colunas opcionais que enriquecem features:
-          - open_time                      (datetime) -> Grupo G (sessao)
-          - quote_asset_volume                        -> Grupo E (order flow)
-          - number_of_trades                          -> Grupo E
-          - taker_buy_base_asset_volume               -> Grupo E
-          - btc_close                      (float)    -> Grupo F (inter-mercado)
-          - eth_close                      (float)    -> Grupo F
-
-        Retorna (X [N, 24], Y [N, 1]).
+        Gera as features no DataFrame original e retorna o DataFrame limpo de NaNs.
         """
         df = df.copy()
 
@@ -225,8 +215,6 @@ class CryptoFeatureBuilder:
         # ================================================================
         # Z-Score EMA-Rolling para colunas em escala bruta
         # ================================================================
-        # Nao aplica z-score em: taker_buy_ratio/delta (ja bounded),
-        # hour_sin/cos (encoding ciclico), high_low_range (ja normalizado)
         COLS_TO_ZSCORE = [
             "ret_1", "ret_4", "ret_16", "ret_64",
             "rsi", "bb_pct", "atr_ratio", "ema_ratio",
@@ -241,7 +229,13 @@ class CryptoFeatureBuilder:
 
         # Remove NaNs criados pelos shifts e janelas
         df = df.dropna(subset=self.FEATURE_COLS + ["target_return"]).copy()
+        return df
 
-        X = df[self.FEATURE_COLS].values
-        Y = df[["target_return"]].values
+    def transform(self, df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Recebe DataFrame com colunas minimas, gera as features e retorna os tensores.
+        """
+        df_feats = self.build_features_df(df)
+        X = df_feats[self.FEATURE_COLS].values
+        Y = df_feats[["target_return"]].values
         return torch.tensor(X, dtype=torch.float32), torch.tensor(Y, dtype=torch.float32)
