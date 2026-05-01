@@ -64,6 +64,8 @@ class CryptoFeatureBuilder:
         "hour_sin", "hour_cos",
         # H — Range intracandle
         "high_low_range",
+        # I — Extras Avançados
+        "macd", "macd_hist", "vwap_dist", "funding_rate"
     ]
 
     def __init__(self, window_size: int = 48):
@@ -213,6 +215,28 @@ class CryptoFeatureBuilder:
             df["hour_cos"] = 0.0
 
         # ================================================================
+        # GRUPO I — Extras Avançados (MACD, VWAP e Funding)
+        # ================================================================
+        
+        # MACD
+        ema_12 = df["close"].ewm(span=12, adjust=False).mean()
+        ema_26 = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd"] = (ema_12 - ema_26) / (df["close"] + 1e-8)
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd"] - df["macd_signal"]
+        
+        # Micro-VWAP Distance (Proxy Intra-candle VWAP)
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+        rolling_vol = df["volume"].rolling(self.window_size).sum()
+        rolling_tpv = (typical_price * df["volume"]).rolling(self.window_size).sum()
+        df["vwap"] = rolling_tpv / (rolling_vol + 1e-8)
+        df["vwap_dist"] = (df["close"] - df["vwap"]) / (df["vwap"] + 1e-8)
+        
+        # Funding Rate já foi injetado pelo dataset.py (se não existir, é 0.0)
+        if "funding_rate" not in df.columns:
+            df["funding_rate"] = 0.0
+
+        # ================================================================
         # Z-Score EMA-Rolling para colunas em escala bruta
         # ================================================================
         COLS_TO_ZSCORE = [
@@ -223,6 +247,7 @@ class CryptoFeatureBuilder:
             "high_low_range",
             "trade_intensity", "avg_trade_size",
             "btc_ret_1", "eth_ret_1",
+            "macd", "macd_hist", "vwap_dist", "funding_rate",
         ]
         for col in COLS_TO_ZSCORE:
             df[col] = self._zscore_ema(df[col])

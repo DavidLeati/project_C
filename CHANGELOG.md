@@ -2,6 +2,46 @@
 
 ---
 
+## Abril de 2026 - Semana 5 (26/04 a 30/04)
+
+*Foco: Correção Causal Multi-Timeframe, Previsão Probabilística de Volatilidade e Recalibração do Agente de Trading*
+
+### Avanços:
+
+- **Reformulação Probabilística dos Previsores Multi-Timeframe (30/04):**
+
+  - Alteração dos quatro T0s de previsão para emitir dois canais por horizonte (`mu`, `raw_sigma`), substituindo o contrato anterior de retorno único por uma formulação explícita de retorno esperado e volatilidade esperada.
+  - Implementação da loss probabilística `_predictor_probabilistic_loss`, usando erro padronizado por `sigma` e penalidade de calibração positiva, permitindo que o previsor informe não apenas a direção esperada do retorno, mas também o grau de incerteza local.
+  - Criação do empacotamento de sinais `mu`, `sigma` e `mu/sigma` por timeframe, expandindo a entrada do `T0_trade` de 4 sinais crus para 12 sinais ajustados por risco.
+- **Recalibração Arquitetural do Logit de Política do Trader (30/04):**
+
+  - Introdução de escala vetorial opcional por saída no `HSAMA` (`output_scale_init`, `learnable_output_scale`), preservando a escala dos previsores e permitindo inflar seletivamente apenas o logit de posição do agente trader.
+  - Configuração do `T0_trade` com `output_scale_init=(1.0, 8.0)`, mantendo o canal de retorno esperado em escala neutra e dando ao canal de posição amplitude inicial suficiente para escapar da região linear fraca do `tanh`.
+  - Aplicação da escala nos dois caminhos de execução (`use_local_greedy` e execução final), garantindo consistência entre predições intermediárias e saída global do grafo.
+- **Controle de Giro e Zona Morta de Exposição (30/04):**
+
+  - Criação de `position_from_logits()` em `trade/loss.py`, mapeando logits para posições contínuas com uma zona morta configurável (`position_deadzone=0.05`) para zerar exposições pequenas e reduzir rebalanceamentos motivados por ruído.
+  - Integração da mesma função no treino, na inferência OOS e no cálculo de métricas, eliminando divergência entre a posição otimizada pela `TriplexTradingLoss` e a posição usada no relatório financeiro.
+  - Reajuste do `TriplexTradingLoss` para operar com custo transacional mais conservador, maior peso de PnL e menor penalidade de viés direcional, buscando reduzir a destruição de retorno por atrito sem forçar colapso em posição fixa.
+- **Correção do Alinhamento Causal de Features Multi-Timeframe (30/04):**
+
+  - Refatoração de `CryptoFeatureBuilder` para expor `build_features_df()`, separando a geração de features do empacotamento final em tensores e permitindo que cada timeframe construa seus indicadores no próprio ritmo nativo.
+  - Alteração de `load_multi_timeframe_sol()` para processar SOL/BTC/ETH em 15m, 1h, 4h e 1d antes da projeção ao grid de 15m, evitando que indicadores de horizontes maiores sejam calculados artificialmente sobre uma série já expandida por forward-fill.
+  - Alinhamento final das matrizes prontas via `.reindex(anchor_index).ffill().bfill()`, mantendo a causalidade temporal e preservando targets/momentums corretos para cada granularidade.
+- **Métricas e Artefatos de Diagnóstico do Novo Regime (30/04):**
+
+  - Expansão do CSV `SOL_trades_oos.csv` para registrar `pred_*`, `vol_*` e `edge_*` por timeframe, tornando auditável a decomposição entre retorno esperado, volatilidade prevista e sinal ajustado por risco.
+  - Atualização do painel inferior do gráfico OOS para plotar `edge = retorno / volatilidade`, deslocando a leitura visual do retorno bruto para o sinal efetivamente consumido pelo trader.
+  - Tradução e padronização de comentários internos em `objectives.py` e `online.py`, mantendo a documentação inline coerente com a linguagem principal do projeto.
+
+### Atrasos:
+
+- **Persistência de Baixa Confiança e Atrito no Backtest OOS (30/04):**
+  - O primeiro diagnóstico após a escala do logit indicou que a confiança média do agente ainda permanecia baixa (`|tanh| ~ 0.075`) e que os custos consumiam mais que o PnL bruto, tornando claro que o gargalo não era apenas amplitude final, mas ausência de estimativa explícita de incerteza e de filtro de não-operação.
+  - Essa constatação atrasou a validação de performance do agente e forçou a mudança de contrato dos previsores para um regime probabilístico, com volatilidade prevista e sinal `mu/sigma` antes de nova rodada de backtest.
+
+---
+
 ## Abril de 2026 - Semana 4 (19/04 a 25/04)
 
 *Foco: Backtest em Dados Reais, Arquitetura Multi-Agente por Timeframe e Suporte a GPU*

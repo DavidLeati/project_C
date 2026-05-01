@@ -138,11 +138,25 @@ class CryptoDataLoader:
                 raise ValueError(f"Coluna 'open_time' ausente em {fname}")
             raw_dfs[tf] = df
 
-        # 2. Usa o indice 15m como ancora temporal de referencia
-        anchor_index = raw_dfs["15m"].index
+        # 2. Usa o known_time (close_time) do 15m como ancora temporal de referencia causal
+        anchor_index = raw_dfs["15m"].index + pd.Timedelta(minutes=15)
+        
+        # Cria o alvo universal em 15m (comum para todas as cabeças do trader)
+        # O target do 15m avalia o retorno do momento da decisão até o fechamento do candle seguinte
+        target_df = pd.DataFrame(index=anchor_index)
+        target_df["target_return"] = (
+            raw_dfs["15m"]["close"].shift(-1).values / raw_dfs["15m"]["close"].values - 1.0
+        )
 
         feature_results: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         min_length = None
+        
+        offset_map = {
+            "15m": pd.Timedelta(minutes=15), 
+            "1h": pd.Timedelta(hours=1), 
+            "4h": pd.Timedelta(hours=4), 
+            "1d": pd.Timedelta(days=1)
+        }
 
         # 3. Processa cada timeframe no seu ritmo nativo, depois reindexa
         for tf in ["15m", "1h", "4h", "1d"]:
@@ -161,16 +175,51 @@ class CryptoDataLoader:
                 else:
                     print(f"[{symbol}/{tf}] Arquivo nao encontrado — usando fallback zero para {col_name}")
 
+            # 4.5. Injeta Funding Rate
+            funding_path = os.path.join(self.data_dir, "SOLUSDT_funding_rate.parquet")
+            if os.path.exists(funding_path):
+                print(f"[SOL/{tf}] Injetando Histórico de Funding Rate")
+                df_fund = pd.read_parquet(funding_path)
+                df_fund = df_fund.set_index("fundingTime")[["fundingRate"]].rename(columns={"fundingRate": "funding_rate"})
+                
+                df_tf = pd.merge_asof(
+                    df_tf.sort_index(),
+                    df_fund.sort_index(),
+                    left_index=True,
+                    right_index=True,
+                    direction="backward",
+                )
+                df_tf["funding_rate"] = df_tf["funding_rate"].fillna(0.0)
+            else:
+                df_tf["funding_rate"] = 0.0
+
             # 5. Processa features no ritmo nativo (Garante target e momentum corretos)
             print(f"[SOL/{tf}] Processando Features nativas (Z-Score Rolling EMA)...")
             df_tf = df_tf.reset_index(drop=False)
             df_feats = builder.build_features_df(df_tf)
 
-            # 6. Alinha (Forward-fill) as features prontas para o grid de 15m
+            # 6. Alinha (Forward-fill) as features prontas para o grid de 15m (Lag Causal)
             if tf != "15m":
                 print(f"[SOL/{tf}] Projetando matriz de features para o grid 15m...")
-            df_feats = df_feats.set_index("open_time")
-            df_aligned = df_feats.reindex(anchor_index).ffill().bfill()
+            
+            # Desloca o index para o momento em que a feature realmente fica disponivel (close do candle)
+            df_feats["known_time"] = df_feats["open_time"] + offset_map[tf]
+            df_feats = df_feats.set_index("known_time").sort_index()
+            
+            anchor_df = pd.DataFrame(index=anchor_index).sort_index()
+            
+            df_aligned = pd.merge_asof(
+                anchor_df,
+                df_feats.drop(columns=["target_return"], errors="ignore"),
+                left_index=True,
+                right_index=True,
+                direction="backward",
+                allow_exact_matches=True,
+            )
+            
+            # Adiciona o alvo universal do grid de 15m
+            df_aligned["target_return"] = target_df["target_return"]
+            df_aligned = df_aligned.dropna(subset=builder.FEATURE_COLS + ["target_return"])
 
             X = df_aligned[builder.FEATURE_COLS].values
             Y = df_aligned[["target_return"]].values

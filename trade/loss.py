@@ -35,12 +35,13 @@ class TriplexTradingLoss:
 
     def __init__(
         self,
-        cost_bps: float       = 0.0010,   # "Pesos no tornozelo": treina com custo dobrado (10bps) para filtrar ruido
-        trade_weight: float   = 50.0,     # Mantido alto para priorizar PnL real
+        cost_bps: float       = 0.0025,   # Treina com custo alto (25bps) para filtrar ruido (ankle weights)
+        trade_weight: float   = 50.0,     # Priorizar PnL real
         return_scale: float   = 100.0,
-        entropy_weight: float = 0.05,
-        bias_weight: float    = 0.2,      # Mantido baixo para permitir surfar tendencias
+        entropy_weight: float = 0.1,      # Penaliza indecisao
+        bias_weight: float    = 0.1,      # Mantido baixo para permitir surfar tendencias
         position_deadzone: float = 0.05,
+        gamma: float          = 0.90,     # Fator de desconto para PnL prospectivo (Horizonte Alongado)
     ):
         self.cost_bps       = cost_bps
         self.trade_weight   = trade_weight
@@ -48,6 +49,7 @@ class TriplexTradingLoss:
         self.entropy_weight = entropy_weight
         self.bias_weight    = bias_weight
         self.position_deadzone = float(position_deadzone)
+        self.gamma          = gamma
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -59,7 +61,20 @@ class TriplexTradingLoss:
 
         position = position_from_logits(preds[:, 1:2], deadzone=self.position_deadzone)  # [-1, +1]
 
-        scaled_targets = targets * self.return_scale
+        # --- HORIZONTE ALONGADO (Discounted Future Returns) ---
+        # Em vez de olhar apenas para o target do próximo candle (t+1),
+        # somamos os retornos futuros do batch com um fator de decaimento (gamma).
+        # Isso permite que a rede enxergue o lucro de uma tendência longa,
+        # justificando pagar a taxa de transação (cost_bps).
+        if self.gamma > 0.0 and targets.size(0) > 1:
+            pnl_targets = torch.zeros_like(targets)
+            pnl_targets[-1] = targets[-1]
+            for t in range(targets.size(0) - 2, -1, -1):
+                pnl_targets[t] = targets[t] + self.gamma * pnl_targets[t+1]
+        else:
+            pnl_targets = targets
+
+        scaled_targets = pnl_targets * self.return_scale
         gross_pnl = position * scaled_targets
 
         shifted_position    = torch.roll(position, shifts=1, dims=0)
@@ -70,8 +85,9 @@ class TriplexTradingLoss:
         # Minimizar loss_trade == maximizar net_pnl
         loss_trade = -net_pnl  # [B, 1]
 
-        # Penalidade de saturacao nos extremos
-        loss_entropy = F.relu(position.abs() - 0.8).pow(2)  # [B, 1]
+        # Penalidade de Indecisao: penaliza posicoes no "meio termo" (|pos| entre 0.0 e 1.0)
+        # Isso forca o modelo a tomar uma decisao clara: ficar FLAT (0) ou fully LONG/SHORT (1/-1).
+        loss_entropy = (position.abs() * (1.0 - position.abs())).expand_as(net_pnl) # [B, 1]
 
         # Penalidade de Vies Direcional.
         # Se o modelo fica so LONG (+1) o batch inteiro, a media e +1 e a perda e alta.

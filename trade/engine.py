@@ -259,7 +259,7 @@ class SolanaMultiTFEngine:
             state_dim=16,
             max_hops=1,
             context_dim=16,
-            output_scale_init=(1.0, 8.0),
+            output_scale_init=(1.0, 0.5),
             learnable_output_scale=True,
         )
         config = HSAMARuntimeConfig(
@@ -274,12 +274,13 @@ class SolanaMultiTFEngine:
         )
         runtime = HSAMAOnlineRuntime(model, config=config)
         runtime._per_sample_loss = TriplexTradingLoss(
-            cost_bps=0.0005,
-            trade_weight=10.0,   # Restaurado
+            cost_bps=0.001,
+            trade_weight=3.0,
             return_scale=100.0,
-            entropy_weight=0.05,
-            bias_weight=2.0,
-            position_deadzone=TRADER_POSITION_DEADZONE,
+            entropy_weight=0.0,
+            bias_weight=10.0,
+            position_deadzone=0.0,
+            gamma=0.0,
         )
 
         # Move para GPU
@@ -433,8 +434,12 @@ class SolanaMultiTFEngine:
                 bx_trade = torch.cat([bx_15m, predictor_signals_norm], dim=1)
 
                 res_trade = trader.observe(bx_trade, by_15m)
+                
+                logits = res_trade.live_prediction[:, 1:2].detach()
+                pos_raw = torch.tanh(logits)
+                
                 posicoes  = position_from_logits(
-                    res_trade.live_prediction[:, 1:2],
+                    logits,
                     deadzone=TRADER_POSITION_DEADZONE,
                 ).detach()
                 ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
@@ -445,11 +450,19 @@ class SolanaMultiTFEngine:
                     eta_s   = elapsed / (batch_idx + 1) * (total_batches - batch_idx - 1)
                     # Posicao media do batch para diagnostico
                     pos_mean = float(posicoes.mean().item())
+                    
+                    logit_mean = logits.mean().item()
+                    logit_std = logits.std().item()
+                    raw_abs = pos_raw.abs().mean().item()
+                    pos_abs = posicoes.abs().mean().item()
+
                     print(
                         f"  Trader Ep {ep+1}/{TRADER_EPOCHS}"
                         f" [{batch_idx+1:>{len(str(total_batches))}}/{total_batches}]"
                         f" {pct:5.1f}%  ETA {eta_s:4.0f}s"
-                        f"  PnL={ep_pnl_trade:+.4f}  pos_media={pos_mean:+.3f}",
+                        f"  PnL={ep_pnl_trade:+.4f}  pos_media={pos_mean:+.3f}\n"
+                        f"    logit_mean={logit_mean:+.4f} logit_std={logit_std:.4f} "
+                        f"raw_abs={raw_abs:.4f} pos_abs={pos_abs:.4f}",
                         flush=True,
                     )
 
