@@ -7,6 +7,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import pandas as pd
+import numpy as np
 import torch
 from typing import Tuple, Dict, Optional
 
@@ -138,14 +139,16 @@ class CryptoDataLoader:
                 raise ValueError(f"Coluna 'open_time' ausente em {fname}")
             raw_dfs[tf] = df
 
-        # 2. Usa o known_time (close_time) do 15m como ancora temporal de referencia causal
+        # 2. Usa o known_time (close_time) do 15m como ancora temporal de referencia causal.
+        # Cada previsor conserva o target nativo do seu timeframe; o retorno 15m
+        # permanece como alvo do trader no grid de decisao.
         anchor_index = raw_dfs["15m"].index + pd.Timedelta(minutes=15)
         
         # Cria o alvo universal em 15m (comum para todas as cabeças do trader)
         # O target do 15m avalia o retorno do momento da decisão até o fechamento do candle seguinte
         target_df = pd.DataFrame(index=anchor_index)
         target_df["target_return"] = (
-            raw_dfs["15m"]["close"].shift(-1).values / raw_dfs["15m"]["close"].values - 1.0
+            np.log(raw_dfs["15m"]["close"].shift(-1).values / raw_dfs["15m"]["close"].values)
         )
 
         feature_results: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -210,15 +213,16 @@ class CryptoDataLoader:
             
             df_aligned = pd.merge_asof(
                 anchor_df,
-                df_feats.drop(columns=["target_return"], errors="ignore"),
+                df_feats,
                 left_index=True,
                 right_index=True,
                 direction="backward",
                 allow_exact_matches=True,
             )
-            
-            # Adiciona o alvo universal do grid de 15m
-            df_aligned["target_return"] = target_df["target_return"]
+
+            if tf == "15m":
+                # Para o grid de decisao, use exatamente o proximo retorno 15m.
+                df_aligned["target_return"] = target_df["target_return"]
             df_aligned = df_aligned.dropna(subset=builder.FEATURE_COLS + ["target_return"])
 
             X = df_aligned[builder.FEATURE_COLS].values

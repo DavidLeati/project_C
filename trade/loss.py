@@ -41,7 +41,8 @@ class TriplexTradingLoss:
         entropy_weight: float = 0.1,      # Penaliza indecisao
         bias_weight: float    = 0.1,      # Mantido baixo para permitir surfar tendencias
         position_deadzone: float = 0.05,
-        gamma: float          = 0.90,     # Fator de desconto para PnL prospectivo (Horizonte Alongado)
+        gamma: float          = 0.0,
+        previous_position: float | torch.Tensor = 0.0,
     ):
         self.cost_bps       = cost_bps
         self.trade_weight   = trade_weight
@@ -50,6 +51,21 @@ class TriplexTradingLoss:
         self.bias_weight    = bias_weight
         self.position_deadzone = float(position_deadzone)
         self.gamma          = gamma
+        self.previous_position = previous_position
+
+    def set_previous_position(self, previous_position: float | torch.Tensor) -> None:
+        """Define a posicao anterior usada para custo na borda do proximo batch."""
+        self.previous_position = previous_position
+
+    def _previous_position_tensor(self, position: torch.Tensor) -> torch.Tensor:
+        prev = torch.as_tensor(
+            self.previous_position,
+            device=position.device,
+            dtype=position.dtype,
+        )
+        if prev.numel() == 1:
+            return prev.reshape(1).expand(position.size(1))
+        return prev.reshape(-1)[: position.size(1)]
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -78,7 +94,7 @@ class TriplexTradingLoss:
         gross_pnl = position * scaled_targets
 
         shifted_position    = torch.roll(position, shifts=1, dims=0)
-        shifted_position[0] = position[0].detach()
+        shifted_position[0] = self._previous_position_tensor(position).detach()
         costs   = torch.abs(position - shifted_position) * self.cost_bps * self.return_scale
         net_pnl = gross_pnl - costs  # [B, 1]
 

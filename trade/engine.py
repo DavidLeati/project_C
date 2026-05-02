@@ -44,6 +44,7 @@ PREDICTOR_SIGMA_FLOOR = 1e-4
 PREDICTOR_SIGMA_OFFSET = 8.0
 PREDICTOR_EDGE_CLIP = 5.0
 TRADER_POSITION_DEADZONE = 0.05
+TRADING_COST_BPS = 0.0005
 
 
 def _predictor_mu_sigma(preds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -259,7 +260,7 @@ class SolanaMultiTFEngine:
             state_dim=16,
             max_hops=1,
             context_dim=16,
-            output_scale_init=(1.0, 0.5),
+            output_scale_init=(1.0, 4.0),
             learnable_output_scale=True,
         )
         config = HSAMARuntimeConfig(
@@ -273,15 +274,16 @@ class SolanaMultiTFEngine:
             multi_scale_t0_config=_make_trade_config(),
         )
         runtime = HSAMAOnlineRuntime(model, config=config)
-        runtime._per_sample_loss = TriplexTradingLoss(
-            cost_bps=0.001,
-            trade_weight=3.0,
+        trading_loss = TriplexTradingLoss(
+            cost_bps=TRADING_COST_BPS,
+            trade_weight=5.0,
             return_scale=100.0,
             entropy_weight=0.0,
-            bias_weight=10.0,
-            position_deadzone=0.0,
+            bias_weight=0.25,
+            position_deadzone=TRADER_POSITION_DEADZONE,
             gamma=0.0,
         )
+        runtime._per_sample_loss = trading_loss
 
         # Move para GPU
         _move_runtime_to_device(runtime, self.device)
@@ -433,8 +435,13 @@ class SolanaMultiTFEngine:
                 by_15m   = Y_train_15m[i:end_i]
                 bx_trade = torch.cat([bx_15m, predictor_signals_norm], dim=1)
 
+                loss_obj = trader._per_sample_loss
+                if hasattr(loss_obj, "set_previous_position"):
+                    prev_pos = getattr(self, "_last_train_position", 0.0)
+                    loss_obj.set_previous_position(prev_pos)
+
                 res_trade = trader.observe(bx_trade, by_15m)
-                
+
                 logits = res_trade.live_prediction[:, 1:2].detach()
                 pos_raw = torch.tanh(logits)
                 
@@ -442,6 +449,7 @@ class SolanaMultiTFEngine:
                     logits,
                     deadzone=TRADER_POSITION_DEADZONE,
                 ).detach()
+                self._last_train_position = float(posicoes[-1].item())
                 ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
 
                 if (batch_idx + 1) % self.report_every == 0 or (batch_idx + 1) == total_batches:
@@ -568,8 +576,8 @@ class SolanaMultiTFEngine:
         gross_np  = pos_np * ret_np
 
         pos_shift_np      = np.roll(pos_np, 1)
-        pos_shift_np[0]   = pos_np[0]
-        cost_np           = np.abs(pos_np - pos_shift_np) * 0.0005
+        pos_shift_np[0]   = 0.0
+        cost_np           = np.abs(pos_np - pos_shift_np) * TRADING_COST_BPS
         net_return_stream = gross_np - cost_np
 
         agent_equity = net_return_stream.cumsum()
@@ -701,7 +709,7 @@ class SolanaMultiTFEngine:
             cost_val   = float(cost_np[step])
             net_val    = float(net_return_stream[step])
             cumul     += net_val
-            pos_change = float(cost_np[step] / 0.0005) if cost_np[step] > 0 else 0.0  # |delta_pos|
+            pos_change = float(cost_np[step] / TRADING_COST_BPS) if cost_np[step] > 0 else 0.0  # |delta_pos|
 
             records.append({
                 "step":              step,
@@ -781,6 +789,38 @@ class SolanaMultiTFEngine:
             "net_returns":  net_return_stream,
             "trades_df":    df_trades,
         }
+
+    def run_walk_forward(self, sample_windows: Optional[list[int]] = None):
+        """
+        Executa uma validacao walk-forward inicial por janelas de tamanho crescente.
+
+        Observacao: cada janela usa o sufixo cronologico mais recente de tamanho N
+        e reaproveita o pipeline completo de run_backtest(). Isso cria uma primeira
+        barreira contra overfit de um unico hold-out sem reescrever o loader para
+        janelas deslizantes arbitrarias.
+        """
+        sample_windows = sample_windows or [8_000, 12_000, 20_000]
+        original_max_samples = self.max_samples
+        summaries = []
+        try:
+            for window in sample_windows:
+                self.max_samples = int(window)
+                print(f"\n[WalkForward] Janela max_samples={self.max_samples}")
+                result = self.run_backtest()
+                net_returns = result["net_returns"]
+                trades_df = result["trades_df"]
+                final_net = float(net_returns.sum())
+                summaries.append(
+                    {
+                        "max_samples": self.max_samples,
+                        "final_net": final_net,
+                        "trades": int((trades_df["position_change"] > 0).sum()),
+                        "flat_pct": float((trades_df["action"] == "FLAT").mean()),
+                    }
+                )
+        finally:
+            self.max_samples = original_max_samples
+        return summaries
 
 
 if __name__ == "__main__":
