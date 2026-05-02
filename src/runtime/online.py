@@ -187,6 +187,24 @@ class HSAMAOnlineRuntime:
     def _expand_policy(self, policy: HSAMAPolicySnapshot, batch_size: int) -> HSAMAPolicySnapshot:
         if policy.context.size(0) == batch_size:
             return policy
+        if policy.context.size(0) > 1 and policy.context.size(0) < batch_size:
+            extra = batch_size - policy.context.size(0)
+
+            def append_last(tensor: torch.Tensor) -> torch.Tensor:
+                return torch.cat(
+                    [tensor, tensor[-1:].expand(extra, *tensor.shape[1:])],
+                    dim=0,
+                )
+
+            return HSAMAPolicySnapshot(
+                edge_dnas=append_last(policy.edge_dnas),
+                context=append_last(policy.context),
+                surprisal=append_last(policy.surprisal),
+                temperature=append_last(policy.temperature),
+                scale=append_last(policy.scale),
+                use_exploration=policy.use_exploration,
+                exploration_noise=append_last(policy.exploration_noise),
+            )
         return HSAMAPolicySnapshot(
             edge_dnas=policy.edge_dnas.expand(batch_size, -1, -1),
             context=policy.context.expand(batch_size, -1),
@@ -293,6 +311,56 @@ class HSAMAOnlineRuntime:
         )
         return context, contexts, due_scale_names, scale_metadata
 
+    def _prepare_multiscale_context_batch_causal(
+        self,
+        x_batch: torch.Tensor,
+        *,
+        step: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[str], dict[str, torch.Tensor]]:
+        if self.multi_scale_builder is None or self.history_buffer is None:
+            raise RuntimeError("multi_scale_builder e history_buffer devem estar habilitados.")
+
+        contexts_per_sample = []
+        metadata_per_sample: list[dict[str, torch.Tensor]] = []
+        latest_contexts: dict[str, torch.Tensor] = {}
+
+        for index in range(x_batch.size(0)):
+            self.history_buffer.append(x_batch[index])
+            logical_step = step + index
+            contexts: dict[str, torch.Tensor] = {}
+
+            for name in self.multi_scale_builder.scale_order:
+                spec = self.multi_scale_builder.scale_specs[name]
+                sequence = self.history_buffer.get_sequence(
+                    stride=spec.stride,
+                    history_length=spec.history_length,
+                    device=x_batch.device,
+                    dtype=x_batch.dtype,
+                )
+                contexts[name] = self.multi_scale_builder.scale_encoders[name](sequence)
+                latest_contexts[name] = contexts[name]
+
+            context, scale_metadata = self.multi_scale_builder.compose_context(
+                contexts,
+                step=logical_step,
+                device=x_batch.device,
+                dtype=x_batch.dtype,
+            )
+            contexts_per_sample.append(context)
+            metadata_per_sample.append(scale_metadata)
+
+        context = torch.cat(contexts_per_sample, dim=0)
+        scale_metadata = {}
+        for key in metadata_per_sample[0]:
+            values = [metadata[key] for metadata in metadata_per_sample]
+            if torch.is_tensor(values[0]):
+                scale_metadata[key] = torch.cat(values, dim=0)
+            else:
+                scale_metadata[key] = values
+
+        due_scale_names = list(self.multi_scale_builder.scale_order)
+        return context, latest_contexts, due_scale_names, scale_metadata
+
     def _prepare_context_batch(
         self,
         x_batch: torch.Tensor,
@@ -305,11 +373,9 @@ class HSAMAOnlineRuntime:
         (política por amostra), idêntico em qualidade ao modo online.
 
         Construtor multi-escala: o buffer de histórico é atualizado sequencialmente
-        com todas as amostras do lote, então um *único* contexto compartilhado é construído
-        a partir do estado de histórico resultante e expandido por todo o lote.
-        Esta é uma aproximação — todas as amostras recebem a mesma política T0
-        — mas evita passos para trás (backward passes) O(B) e é semanticamente coerente
-        porque o contexto T0 resume o *histórico visto até agora*.
+        e cada amostra recebe um contexto construído no seu ponto cronológico do
+        mini-lote. Isso preserva a causalidade: a amostra i pode usar x[:i], mas
+        nunca x[i+1:].
         """
         if self.multi_scale_builder is None:
             # Cada amostra recebe um contexto independente — fidelidade total.
@@ -319,25 +385,7 @@ class HSAMAOnlineRuntime:
         if self.history_buffer is None:
             raise RuntimeError("history_buffer deve existir quando multi_scale_builder está habilitado.")
 
-        batch_size = x_batch.size(0)
-        for i in range(batch_size):
-            self.history_buffer.append(x_batch[i])
-
-        contexts, due_scale_names = self.multi_scale_builder.prepare_contexts(
-            self.history_buffer,
-            step=step,
-            device=x_batch.device,
-            dtype=x_batch.dtype,
-        )
-        context, scale_metadata = self.multi_scale_builder.compose_context(
-            contexts,
-            step=step,
-            device=x_batch.device,
-            dtype=x_batch.dtype,
-        )
-        # contexto: [1, context_dim] → replicado por todo o lote
-        context = context.expand(batch_size, -1)
-        return context, contexts, due_scale_names, scale_metadata
+        return self._prepare_multiscale_context_batch_causal(x_batch, step=step)
 
     def _insert_ready_events(
         self,
@@ -479,24 +527,21 @@ class HSAMAOnlineRuntime:
         """
         batch_size = x_live.size(0)
         step = self.global_step
+        last_step = step + batch_size - 1
 
         # --- Contexto e política T0 ---
         context, contexts, due_scale_names, scale_metadata = self._prepare_context_batch(
             x_live, step=step
         )
-        # Colapsa os contextos por amostra em um único contexto representativo
-        # para que a política resultante (edge_dnas formato [1, E, D]) possa ser
-        # expandida por _expand_policy para cobrir o lote completo (vivo + replay).
-        # Para o codificador simples, esta é a média das codificações por amostra;
-        # para o construtor multi-escala, o contexto já é [1, D] (compartilhado).
-        context_for_policy = context.mean(dim=0, keepdim=True)  # [1, context_dim]
+        # A politica T0 e construida por amostra, sem media de contexto
+        # que misture eventos futuros no mini-lote.
         global_surprisal = self.global_surprisal_estimator.current(
-            batch_size=1,
+            batch_size=batch_size,
             device=x_live.device,
             dtype=x_live.dtype,
         )
         policy = self.model.build_policy_from_context(
-            context_for_policy,
+            context,
             surprisal=global_surprisal,
             use_exploration=self.config.use_exploration,
         )
@@ -536,7 +581,7 @@ class HSAMAOnlineRuntime:
 
         if self.multi_scale_builder is not None and due_scale_names:
             self.multi_scale_builder.commit_contexts(
-                contexts, due_scale_names=due_scale_names, step=step
+                contexts, due_scale_names=due_scale_names, step=last_step
             )
 
         # --- Atualização de surprisal (apenas amostras vivas, sem linhas de replay) ---
@@ -545,7 +590,7 @@ class HSAMAOnlineRuntime:
 
         if self.multi_scale_builder is not None and due_scale_names:
             self.multi_scale_builder.update_scale_surprisal(
-                due_scale_names, losses=live_loss, step=step
+                due_scale_names, losses=live_loss, step=last_step
             )
 
         buffer_inserted = False
@@ -558,11 +603,11 @@ class HSAMAOnlineRuntime:
                     y=y_live[i : i + 1],
                     priority_surprisal=priority_value,
                     raw_loss=raw_loss_value,
-                    event_id=step * batch_size + i,
+                    event_id=step + i,
                 )
                 buffer_inserted = buffer_inserted or inserted
 
-        self.global_step += 1
+        self.global_step += batch_size
         return RuntimeStepResult(
             event_id=step,
             live_prediction=batch_prediction[:batch_size].detach(),
