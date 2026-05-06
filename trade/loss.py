@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def position_from_logits(logits: torch.Tensor, deadzone: float = 0.05) -> torch.Tensor:
+def position_from_logits(logits: torch.Tensor, deadzone: float = 0.02) -> torch.Tensor:
     """Mapeia logits para posicao e zera exposicao pequena para evitar giro em ruido."""
     raw_position = torch.tanh(logits)
     if deadzone <= 0.0:
@@ -12,43 +12,86 @@ def position_from_logits(logits: torch.Tensor, deadzone: float = 0.05) -> torch.
     return raw_position.sign() * active
 
 
+# ---------------------------------------------------------------------------
+# Loss do Preditor: Gaussian NLL + Incentivo Direcional
+# ---------------------------------------------------------------------------
+
+def predictor_directional_loss(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    sigma_offset: float = 8.0,
+    sigma_floor: float = 1e-4,
+    direction_weight: float = 0.5,
+) -> torch.Tensor:
+    """
+    Combina Gaussian NLL com incentivo direcional.
+
+    O NLL puro tende a convergir para mu=0 e sigma grande (aposta segura).
+    O componente direcional recompensa sign(mu) == sign(target), incentivando
+    o preditor a pelo menos acertar a direcao, mesmo com magnitude imprecisa.
+
+    preds:   [B, 2] -> col 0: mu, col 1: log_sigma_raw
+    targets: [B, 1] -> retorno real
+    """
+    mu = preds[:, 0:1]
+    sigma = F.softplus(preds[:, 1:2] - sigma_offset) + sigma_floor
+
+    # Gaussian NLL
+    standardized_error = ((targets - mu) / sigma).pow(2)
+    calibration_penalty = torch.log(sigma / sigma_floor)
+    nll = (0.5 * standardized_error + calibration_penalty)
+
+    # Incentivo Direcional: penaliza quando sign(mu) != sign(target)
+    # Usa uma proxy suave: -mu * sign(target) (negativo quando acerta, positivo quando erra)
+    # Normalizada pelo sigma para escalar adequadamente
+    direction_signal = -mu * targets.sign() / sigma.detach()
+    # Clipa para evitar gradientes explosivos
+    direction_loss = direction_signal.clamp(-3.0, 3.0)
+
+    total = nll + direction_weight * direction_loss
+    return total.reshape(preds.size(0), -1).mean(dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Loss do Trader: Puramente PnL-Driven (sem head de retorno)
+# ---------------------------------------------------------------------------
+
 class TriplexTradingLoss:
     """
-    Funcao Multi-Objetivo (Actor-Critic Style) para a Rede HSAMA de Trade.
+    Loss puramente de trading para o agente de posicao.
 
-    Setor 0 (Critico): MSE sobre o log-return — ancora as representacoes
-                       matematicas da GRU/contexto.
+    O modelo agora tem out_features=1 (apenas logit de posicao).
+    A loss maximiza PnL liquido com regularizacao de vies e estagnacao.
 
-    Setor 1 (Ator):    Objetivo Sharpe intra-batch — maximiza a razao
-                       PnL_medio / PnL_std dentro do batch.
-                       Ao contrario do PnL bruto medio, o Sharpe nao pode
-                       ser maximizado com "always long/short": uma posicao
-                       fixa tem PnL_std proporcional ao std dos retornos,
-                       mas PnL_medio proporcional ao retorno medio do periodo.
-                       O gradiente obriga o modelo a encontrar timing real:
-                       entrar certo e sair certo para ter alta media e baixo std.
+    Componentes:
+      1. PnL Liquido: -net_pnl (maximiza retorno apos custos)
+      2. Penalidade de Vies: posicao media do batch^2 (impede always-long/short)
+      3. Penalidade de Estagnacao: penaliza |pos_mean| > threshold
 
-    Regularizacao:     Penalidade suave sobre posicoes extremas (|pos| > 0.8).
-                       Permite posicoes moderadas livremente, so penaliza
-                       saturacao perto de +-1.
+    Nota: A penalidade de diversidade (1/var) foi REMOVIDA pois causava
+    flipping constante entre +1 e -1 no OOS, gerando custos catastroficos.
+    O custo de transacao elevado (ankle weights) naturalmente desincentiva
+    mudancas de posicao desnecessarias.
     """
 
     def __init__(
         self,
-        cost_bps: float       = 0.0025,   # Treina com custo alto (25bps) para filtrar ruido (ankle weights)
-        trade_weight: float   = 50.0,     # Priorizar PnL real
+        cost_bps: float       = 0.002,
+        trade_weight: float   = 5.0,
         return_scale: float   = 100.0,
-        entropy_weight: float = 0.1,      # Penaliza indecisao
-        bias_weight: float    = 0.1,      # Mantido baixo para permitir surfar tendencias
-        position_deadzone: float = 0.05,
+        bias_weight: float    = 3.0,
+        stagnation_threshold: float = 0.6,
+        stagnation_weight: float = 2.0,
+        position_deadzone: float = 0.02,
         gamma: float          = 0.0,
         previous_position: float | torch.Tensor = 0.0,
     ):
         self.cost_bps       = cost_bps
         self.trade_weight   = trade_weight
         self.return_scale   = return_scale
-        self.entropy_weight = entropy_weight
         self.bias_weight    = bias_weight
+        self.stagnation_threshold = stagnation_threshold
+        self.stagnation_weight = stagnation_weight
         self.position_deadzone = float(position_deadzone)
         self.gamma          = gamma
         self.previous_position = previous_position
@@ -69,19 +112,16 @@ class TriplexTradingLoss:
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        preds:   [Batch, 2]  -> col 0: previsao de retorno | col 1: logit de posicao
+        preds:   [Batch, 1]  -> logit de posicao
         targets: [Batch, 1]  -> log-retorno real do passo t+1
         """
-        pred_return = preds[:, 0:1]
-        loss_mse = F.mse_loss(pred_return, targets, reduction="none")  # [B, 1]
-
-        position = position_from_logits(preds[:, 1:2], deadzone=self.position_deadzone)  # [-1, +1]
+        # IMPORTANTE: deadzone=0 aqui para manter fluxo de gradientes.
+        # O deadzone hard e aplicado apenas na engine para metricas/logs.
+        # Se usassemos deadzone > 0 aqui e os logits iniciais fossem pequenos,
+        # posicao seria sempre 0, PnL seria 0, gradiente seria 0 -> trap.
+        position = torch.tanh(preds[:, 0:1])  # [-1, +1] sem deadzone
 
         # --- HORIZONTE ALONGADO (Discounted Future Returns) ---
-        # Em vez de olhar apenas para o target do próximo candle (t+1),
-        # somamos os retornos futuros do batch com um fator de decaimento (gamma).
-        # Isso permite que a rede enxergue o lucro de uma tendência longa,
-        # justificando pagar a taxa de transação (cost_bps).
         if self.gamma > 0.0 and targets.size(0) > 1:
             pnl_targets = torch.zeros_like(targets)
             pnl_targets[-1] = targets[-1]
@@ -98,19 +138,25 @@ class TriplexTradingLoss:
         costs   = torch.abs(position - shifted_position) * self.cost_bps * self.return_scale
         net_pnl = gross_pnl - costs  # [B, 1]
 
-        # Minimizar loss_trade == maximizar net_pnl
+        # 1. Minimizar loss_trade == maximizar net_pnl
         loss_trade = -net_pnl  # [B, 1]
 
-        # Penalidade de Indecisao: penaliza posicoes no "meio termo" (|pos| entre 0.0 e 1.0)
-        # Isso forca o modelo a tomar uma decisao clara: ficar FLAT (0) ou fully LONG/SHORT (1/-1).
-        loss_entropy = (position.abs() * (1.0 - position.abs())).expand_as(net_pnl) # [B, 1]
+        # Regularizacoes batch-level: so fazem sentido com B > 1.
+        # No OOS step-by-step (B=1), aplicar apenas o PnL puro.
+        batch_size = position.size(0)
+        if batch_size > 1:
+            # 2. Penalidade de Vies Direcional
+            pos_mean = position.mean()
+            loss_bias = pos_mean.pow(2).expand_as(net_pnl)
 
-        # Penalidade de Vies Direcional.
-        # Se o modelo fica so LONG (+1) o batch inteiro, a media e +1 e a perda e alta.
-        # Obriga o modelo a alternar e encontrar os verdadeiros sinais,
-        # impedindo a histerese do custo de transacao.
-        loss_bias = position.mean().pow(2).expand_as(net_pnl) # [B, 1]
+            # 3. Penalidade de Estagnacao
+            excess = F.relu(pos_mean.abs() - self.stagnation_threshold)
+            loss_stagnation = excess.pow(2).expand_as(net_pnl)
 
-        total = loss_mse + self.trade_weight * loss_trade + self.entropy_weight * loss_entropy + self.bias_weight * loss_bias
+            total = (self.trade_weight * loss_trade
+                     + self.bias_weight * loss_bias
+                     + self.stagnation_weight * loss_stagnation)
+        else:
+            total = self.trade_weight * loss_trade
 
         return total.squeeze(1)
