@@ -213,15 +213,15 @@ class MonolithicEngine:
             predictors[tf].multi_scale_builder.to(self.device)
 
         predictor_signal_features = len(self.TIMEFRAMES)
-        trader_features = X_train_15m.shape[1] + predictor_signal_features
+        trader_features = X_train_15m.shape[1] + predictor_signal_features + 1
         trader_model = HSAMA(
             in_features=trader_features,
-            out_features=1,
+            out_features=2,
             num_nodes=8,
             state_dim=16,
             max_hops=2,
             context_dim=16,
-            output_scale_init=(1.0,),
+            output_scale_init=(1.0, 1.0),
             learnable_output_scale=True,
         )
         trader_config = HSAMARuntimeConfig(
@@ -406,7 +406,22 @@ class MonolithicEngine:
                 pred_signals_raw = torch.cat(edges, dim=1)
                 pred_signals = sig_normalizer.normalize(pred_signals_raw)
 
-                bx_trade = torch.cat([bx_15m, pred_signals], dim=1)
+                # -------------------------------------------------------------
+                # Pseudo-Autoregressive Position Feedback (2-Pass Trick)
+                # -------------------------------------------------------------
+                with torch.no_grad():
+                    # Pass 1: Estimate trajectory without valid past position
+                    dummy_prev = torch.full((B, 1), last_position, device=self.device)
+                    bx_trade_dummy = torch.cat([bx_15m, pred_signals, dummy_prev], dim=1)
+                    trader_ctx_d, _, _, _ = trader._prepare_context_batch(bx_trade_dummy, step=global_step)
+                    pol_d = trader.model.build_policy_from_context(trader_ctx_d, surprisal=surprisal)
+                    pred_d, _ = trader.model.execute_policy(bx_trade_dummy, pol_d, raw_output=True)
+                    pos_estim = position_from_logits(pred_d, deadzone=0.0)
+                    
+                    prev_positions = torch.roll(pos_estim, shifts=1, dims=0)
+                    prev_positions[0] = last_position
+
+                bx_trade = torch.cat([bx_15m, pred_signals, prev_positions], dim=1)
 
                 trading_loss_fn.set_previous_position(last_position)
 
@@ -439,9 +454,12 @@ class MonolithicEngine:
                 surprisal_estimator.observe(loss_pnl.detach())
 
                 with torch.no_grad():
-                    logits   = pred_trade[:, 0:1].detach()
-                    pos_raw  = torch.tanh(logits)
+                    logits   = pred_trade.detach()
                     posicoes = position_from_logits(logits, deadzone=TRADER_POSITION_DEADZONE)
+                    
+                    # For logging stats, just use the directional part
+                    pos_raw = torch.tanh(logits[:, 0:1])
+                    
                     last_position = float(posicoes[-1].item())
                     ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
 
@@ -450,8 +468,8 @@ class MonolithicEngine:
                     n_short  = int((posicoes < -TRADER_POSITION_DEADZONE).sum().item())
                     n_flat   = n_batch - n_long - n_short
                     pos_mean = float(posicoes.mean().item())
-                    logit_mean = float(logits.mean().item())
-                    logit_std  = float(logits.std().item())
+                    logit_mean = float(logits[:, 0].mean().item())
+                    logit_std  = float(logits[:, 0].std().item())
                     raw_abs    = float(pos_raw.abs().mean().item())
                     pos_abs    = float(posicoes.abs().mean().item())
 
@@ -472,11 +490,20 @@ class MonolithicEngine:
             print(f"\n  Ep {ep+1}/{JOINT_EPOCHS} concluido em {time.time()-t_start:.1f}s")
             print(f"   T0_trade PnL Bruto: {ep_pnl_trade:+.4f}")
 
+        # Salva um checkpoint temporário logo após o treino, para evitar perda caso o OOS quebre
+        os.makedirs("models", exist_ok=True)
+        tmp_ckpt_path = f"models/monolithic_temp_pre_oos.pt"
+        torch.save({
+            "trader": trader.model.state_dict(),
+            "predictors": {tf: predictors[tf].model.state_dict() for tf in self.TIMEFRAMES}
+        }, tmp_ckpt_path)
+        print(f"\n[Backup de Segurança] Pesos salvos provisoriamente em {tmp_ckpt_path} antes do OOS!")
+
         # ---------------------------------------------------------------
         # FASE 2: Inferência OOS em batch
         # ---------------------------------------------------------------
         print(f"\n{'-'*65}")
-        print(" [Fase 2] Inferência OOS (batch)")
+        print(" [Fase 2] Inferência OOS")
         print(f"{'-'*65}")
 
         trader.model.eval()
@@ -486,32 +513,48 @@ class MonolithicEngine:
             p.multi_scale_builder.eval()
 
         with torch.no_grad():
-            edges_oos = []
             test_start_step = (PREDICTOR_WARMUP_EPOCHS + JOINT_EPOCHS) * train_len
+            B_oos = X_test_15m.size(0)
+            pred_trade_oos_list = []
+            curr_pos = torch.full((1, 1), last_position, device=self.device)
             
-            for tf in self.TIMEFRAMES:
-                rt = predictors[tf]
-                bx_all = data_dev[tf][2]
-                context, _, _, _ = rt._prepare_context_batch(bx_all, step=test_start_step)
-                policy = rt.model.build_policy_from_context(context, surprisal=0.0)
-                pred_all, _ = rt.model.execute_policy(bx_all, policy, raw_output=True)
+            print("   -> Simulando OOS step-by-step (Autoregressivo)...")
+            for i in range(B_oos):
+                if i % max(1, B_oos // 10) == 0:
+                    print(f"      OOS Progresso: {100.0 * i / B_oos:.1f}%")
                 
-                mu, sigma = _predictor_mu_sigma(pred_all)
-                edge = (mu / sigma).clamp(-PREDICTOR_EDGE_CLIP, PREDICTOR_EDGE_CLIP)
-                edges_oos.append(edge)
-
-            pred_signals_oos_raw = torch.cat(edges_oos, dim=1)
-            # EMA congelado no estado do treino — sem atualização no OOS
-            pred_signals_oos = sig_normalizer.normalize_frozen(pred_signals_oos_raw)
-
-            bx_trade_oos = torch.cat([X_test_15m, pred_signals_oos], dim=1)
+                # Predictors
+                edges_i = []
+                for tf in self.TIMEFRAMES:
+                    rt = predictors[tf]
+                    bx_i = data_dev[tf][2][i:i+1]
+                    ctx_i, latest_i, due_i, _ = rt._prepare_context_batch(bx_i, step=test_start_step + i)
+                    pol_i = rt.model.build_policy_from_context(ctx_i, surprisal=0.0)
+                    pred_i, _ = rt.model.execute_policy(bx_i, pol_i, raw_output=True)
+                    rt.multi_scale_builder.commit_contexts(latest_i, due_scale_names=due_i, step=test_start_step + i + 1)
+                    
+                    mu, sigma = _predictor_mu_sigma(pred_i)
+                    edge = (mu / sigma).clamp(-PREDICTOR_EDGE_CLIP, PREDICTOR_EDGE_CLIP)
+                    edges_i.append(edge)
+                
+                sig_raw_i = torch.cat(edges_i, dim=1)
+                sig_i = sig_normalizer.normalize_frozen(sig_raw_i)
+                
+                # Trader
+                bx_trade_i = torch.cat([X_test_15m[i:i+1], sig_i, curr_pos], dim=1)
+                t_ctx_i, t_latest_i, t_due_i, _ = trader._prepare_context_batch(bx_trade_i, step=test_start_step + i)
+                t_pol_i = trader.model.build_policy_from_context(t_ctx_i, surprisal=0.0)
+                t_pred_i, _ = trader.model.execute_policy(bx_trade_i, t_pol_i, raw_output=True)
+                trader.multi_scale_builder.commit_contexts(t_latest_i, due_scale_names=t_due_i, step=test_start_step + i + 1)
+                
+                pred_trade_oos_list.append(t_pred_i)
+                curr_pos = position_from_logits(t_pred_i, deadzone=0.0)
             
-            trader_context, _, _, _ = trader._prepare_context_batch(bx_trade_oos, step=test_start_step)
-            trader_policy = trader.model.build_policy_from_context(trader_context, surprisal=0.0)
-            pred_trade_oos, _ = trader.model.execute_policy(bx_trade_oos, trader_policy, raw_output=True)
+            print("      OOS Progresso: 100.0%")
+            pred_trade_oos = torch.cat(pred_trade_oos_list, dim=0)
 
         posicoes_teste = position_from_logits(
-            pred_trade_oos[:, 0:1], deadzone=TRADER_POSITION_DEADZONE
+            pred_trade_oos, deadzone=TRADER_POSITION_DEADZONE
         ).cpu()
 
         # ---------------------------------------------------------------

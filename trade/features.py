@@ -106,15 +106,11 @@ class CryptoFeatureBuilder:
     # API publica
     # ------------------------------------------------------------------
 
-    def build_features_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _build_feature_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Gera as features no DataFrame original e retorna o DataFrame limpo de NaNs.
+        Gera apenas as colunas de features no DataFrame original.
         """
         df = df.copy()
-
-        # ---- Target (Y) ----
-        # log-retorno do candle SEGUINTE (t -> t+1), sem look-ahead
-        df["target_return"] = np.log(df["close"].shift(-1) / df["close"])
 
         # ================================================================
         # GRUPO A — Momentum (4 horizontes)
@@ -252,8 +248,25 @@ class CryptoFeatureBuilder:
         for col in COLS_TO_ZSCORE:
             df[col] = self._zscore_ema(df[col])
 
-        # Remove NaNs criados pelos shifts e janelas
+        return df
+
+    def build_features_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Gera as features e o target do proximo candle para treino/backtest.
+        """
+        df = self._build_feature_columns(df)
+        df["target_return"] = np.log(df["close"].shift(-1) / df["close"])
+
+        # Remove NaNs criados pelos shifts, janelas e target futuro
         df = df.dropna(subset=self.FEATURE_COLS + ["target_return"]).copy()
+        return df
+
+    def build_live_features_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Gera features sem target futuro para inferencia em tempo real.
+        """
+        df = self._build_feature_columns(df)
+        df = df.dropna(subset=self.FEATURE_COLS).copy()
         return df
 
     def transform(self, df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor]:

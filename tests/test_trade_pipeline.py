@@ -20,11 +20,11 @@ def test_triplex_loss_charges_batch_boundary_cost_from_previous_position():
         cost_bps=0.01,
         trade_weight=1.0,
         return_scale=1.0,
-        entropy_weight=0.0,
         bias_weight=0.0,
+        stagnation_weight=0.0,
         position_deadzone=0.0,
     )
-    preds = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
+    preds = torch.tensor([[0.0], [0.0]])
     targets = torch.zeros(2, 1)
 
     loss.set_previous_position(0.0)

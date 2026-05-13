@@ -2,14 +2,22 @@ import torch
 import torch.nn.functional as F
 
 
-def position_from_logits(logits: torch.Tensor, deadzone: float = 0.02) -> torch.Tensor:
-    """Mapeia logits para posicao e zera exposicao pequena para evitar giro em ruido."""
-    raw_position = torch.tanh(logits)
+def position_from_logits(logits: torch.Tensor, deadzone: float = 0.02, max_leverage: float = 20.0) -> torch.Tensor:
+    """Mapeia logits para posicao e alavancagem, zerando exposicao pequena para evitar giro em ruido."""
+    if logits.shape[-1] == 1:
+        raw_position = torch.tanh(logits)
+        leverage = torch.ones_like(raw_position)
+    else:
+        raw_position = torch.tanh(logits[..., 0:1])
+        # Leverage goes from 1.0 to max_leverage smoothly
+        leverage = 1.0 + (max_leverage - 1.0) * torch.sigmoid(logits[..., 1:2])
+
     if deadzone <= 0.0:
-        return raw_position
+        return raw_position * leverage
+
     abs_position = raw_position.abs()
     active = F.relu(abs_position - deadzone) / (1.0 - deadzone)
-    return raw_position.sign() * active
+    return raw_position.sign() * active * leverage
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +120,13 @@ class TriplexTradingLoss:
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        preds:   [Batch, 1]  -> logit de posicao
+        preds:   [Batch, 1 ou 2]  -> logit de posicao (e opcionalmente alavancagem)
         targets: [Batch, 1]  -> log-retorno real do passo t+1
         """
         # IMPORTANTE: deadzone=0 aqui para manter fluxo de gradientes.
         # O deadzone hard e aplicado apenas na engine para metricas/logs.
-        # Se usassemos deadzone > 0 aqui e os logits iniciais fossem pequenos,
-        # posicao seria sempre 0, PnL seria 0, gradiente seria 0 -> trap.
-        position = torch.tanh(preds[:, 0:1])  # [-1, +1] sem deadzone
+        # position_from_logits ja lida com a alavancagem se preds tiver dimensao 2
+        position = position_from_logits(preds, deadzone=0.0)
 
         # --- HORIZONTE ALONGADO (Discounted Future Returns) ---
         if self.gamma > 0.0 and targets.size(0) > 1:
@@ -145,8 +152,14 @@ class TriplexTradingLoss:
         # No OOS step-by-step (B=1), aplicar apenas o PnL puro.
         batch_size = position.size(0)
         if batch_size > 1:
+            if preds.shape[-1] == 2:
+                # Extrai apenas a direcionalidade [-1, 1] para a penalidade
+                raw_pos = torch.tanh(preds[..., 0:1])
+            else:
+                raw_pos = position
+
             # 2. Penalidade de Vies Direcional
-            pos_mean = position.mean()
+            pos_mean = raw_pos.mean()
             loss_bias = pos_mean.pow(2).expand_as(net_pnl)
 
             # 3. Penalidade de Estagnacao
