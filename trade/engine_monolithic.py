@@ -242,6 +242,7 @@ class MonolithicEngine:
             bias_weight=0.5,
             stagnation_threshold=0.7,
             stagnation_weight=0.5,
+            sharpe_weight=0.5,
             position_deadzone=TRADER_POSITION_DEADZONE,
             gamma=0.0,
         )

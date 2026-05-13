@@ -61,20 +61,22 @@ def predictor_directional_loss(
 
 
 # ---------------------------------------------------------------------------
-# Loss do Trader: Puramente PnL-Driven (sem head de retorno)
+# Loss do Trader: PnL-Driven com controle de risco por Sharpe
 # ---------------------------------------------------------------------------
 
 class TriplexTradingLoss:
     """
-    Loss puramente de trading para o agente de posicao.
+    Loss de trading para o agente de posicao.
 
     O modelo agora tem out_features=1 (apenas logit de posicao).
-    A loss maximiza PnL liquido com regularizacao de vies e estagnacao.
+    A loss maximiza PnL liquido com regularizacao de vies, estagnacao e
+    qualidade risco-retorno do fluxo de PnL.
 
     Componentes:
       1. PnL Liquido: -net_pnl (maximiza retorno apos custos)
       2. Penalidade de Vies: posicao media do batch^2 (impede always-long/short)
       3. Penalidade de Estagnacao: penaliza |pos_mean| > threshold
+      4. Sharpe do batch: -mean(net_pnl) / std(net_pnl), clipado para estabilidade
 
     Nota: A penalidade de diversidade (1/var) foi REMOVIDA pois causava
     flipping constante entre +1 e -1 no OOS, gerando custos catastroficos.
@@ -90,6 +92,9 @@ class TriplexTradingLoss:
         bias_weight: float    = 3.0,
         stagnation_threshold: float = 0.6,
         stagnation_weight: float = 2.0,
+        sharpe_weight: float = 0.0,
+        sharpe_eps: float = 1e-6,
+        sharpe_clip: float = 3.0,
         position_deadzone: float = 0.02,
         gamma: float          = 0.0,
         previous_position: float | torch.Tensor = 0.0,
@@ -100,6 +105,9 @@ class TriplexTradingLoss:
         self.bias_weight    = bias_weight
         self.stagnation_threshold = stagnation_threshold
         self.stagnation_weight = stagnation_weight
+        self.sharpe_weight = sharpe_weight
+        self.sharpe_eps = sharpe_eps
+        self.sharpe_clip = sharpe_clip
         self.position_deadzone = float(position_deadzone)
         self.gamma          = gamma
         self.previous_position = previous_position
@@ -166,9 +174,14 @@ class TriplexTradingLoss:
             excess = F.relu(pos_mean.abs() - self.stagnation_threshold)
             loss_stagnation = excess.pow(2).expand_as(net_pnl)
 
+            pnl_std = net_pnl.std(unbiased=False).clamp_min(self.sharpe_eps)
+            sharpe = (net_pnl.mean() / pnl_std).clamp(-self.sharpe_clip, self.sharpe_clip)
+            loss_sharpe = (-sharpe).expand_as(net_pnl)
+
             total = (self.trade_weight * loss_trade
                      + self.bias_weight * loss_bias
-                     + self.stagnation_weight * loss_stagnation)
+                     + self.stagnation_weight * loss_stagnation
+                     + self.sharpe_weight * loss_sharpe)
         else:
             total = self.trade_weight * loss_trade
 

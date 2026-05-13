@@ -37,6 +37,27 @@ def test_triplex_loss_charges_batch_boundary_cost_from_previous_position():
     assert torch.isclose(with_boundary_cost[1], no_boundary_cost[1])
 
 
+def test_triplex_loss_sharpe_weight_penalizes_volatile_pnl_stream():
+    loss = TriplexTradingLoss(
+        cost_bps=0.0,
+        trade_weight=0.0,
+        return_scale=1.0,
+        bias_weight=0.0,
+        stagnation_weight=0.0,
+        sharpe_weight=1.0,
+        position_deadzone=0.0,
+    )
+    stable_preds = torch.full((4, 1), 1.0)
+    stable_targets = torch.full((4, 1), 0.1)
+    volatile_preds = torch.ones(4, 1)
+    volatile_targets = torch.tensor([[0.2], [0.0], [0.2], [0.0]])
+
+    stable_loss = loss(stable_preds, stable_targets).mean()
+    volatile_loss = loss(volatile_preds, volatile_targets).mean()
+
+    assert volatile_loss > stable_loss
+
+
 def test_position_from_logits_deadzone_zeroes_small_positions():
     logits = torch.tensor([[-0.02], [0.0], [0.02], [2.0]])
     positions = position_from_logits(logits, deadzone=0.05)
