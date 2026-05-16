@@ -290,7 +290,7 @@ class SolanaMultiTFEngine:
             bias_weight=0.5,             # Leve: o custo no PnL e o regulador principal
             stagnation_threshold=0.7,
             stagnation_weight=0.5,       # Leve: so ativa em casos extremos
-            sharpe_weight=0.5,           # Premia PnL liquido estavel e reduz giro ruidoso
+            sharpe_weight=3.0,           # Premia PnL liquido estavel e reduz giro ruidoso
             position_deadzone=TRADER_POSITION_DEADZONE,
             gamma=0.0,
         )

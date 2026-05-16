@@ -49,6 +49,9 @@ PREDICTOR_EDGE_CLIP    = 2.0
 TRADER_POSITION_DEADZONE = 0.15
 TRADING_COST_BPS       = 0.0005
 
+PERF_WINDOW            = 20    # janela de performance recente (candles)
+N_PERF_FEATURES        = 3     # rolling_pnl, local_drawdown, hit_rate
+
 PREDICTOR_WARMUP_EPOCHS = 2    # walk-forward: menos épocas por janela para evitar overfitting
 JOINT_EPOCHS            = 3    # 3 épocas suficientes — após ep5 já há sinais claros de saturação
 
@@ -141,6 +144,71 @@ class EMASignalNormalizer:
 
 
 # ---------------------------------------------------------------------------
+# Rastreador de Performance Recente (features de auto-consciência)
+# ---------------------------------------------------------------------------
+
+class RollingPerformanceTracker:
+    """Mantém uma janela móvel de PnL recente para gerar features de
+    auto-consciência do trader: PnL médio, drawdown local e hit rate.
+
+    Essas features permitem que a rede aprenda a modular o risco
+    dinamicamente, reduzindo posição quando a estratégia está
+    dessincronizada com o regime de mercado.
+    """
+
+    def __init__(self, window: int = PERF_WINDOW, device: torch.device = torch.device("cpu")):
+        self.window = window
+        self.device = device
+        self.pnl_buffer: list[float] = []
+        self.cumul_equity = 0.0
+        self.peak_equity = 0.0
+
+    def reset(self):
+        self.pnl_buffer = []
+        self.cumul_equity = 0.0
+        self.peak_equity = 0.0
+
+    def update(self, net_pnl_steps: np.ndarray):
+        """Atualiza com os PnL líquidos por step de um batch."""
+        for val in net_pnl_steps.flat:
+            self.pnl_buffer.append(float(val))
+            self.cumul_equity += float(val)
+            self.peak_equity = max(self.peak_equity, self.cumul_equity)
+        # Mantém apenas os últimos `window` valores
+        if len(self.pnl_buffer) > self.window * 2:
+            self.pnl_buffer = self.pnl_buffer[-self.window:]
+
+    def get_features(self, batch_size: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """Retorna [B, 3] com (rolling_pnl, local_drawdown, hit_rate).
+
+        Valores são escalados e clampados para serem compatíveis com
+        as outras features da rede (magnitude ~[-3, 3]).
+        """
+        if len(self.pnl_buffer) == 0:
+            return torch.zeros(batch_size, N_PERF_FEATURES, device=self.device, dtype=dtype)
+
+        buf = self.pnl_buffer[-self.window:]
+        n = len(buf)
+
+        # 1. PnL médio recente (x100 para escalar, clamp [-3, 3])
+        rolling_pnl = (sum(buf) / n) * 100.0
+        rolling_pnl = max(-3.0, min(3.0, rolling_pnl))
+
+        # 2. Drawdown local: distância do pico (sempre <= 0, x10, clamp [-3, 0])
+        local_dd = (self.cumul_equity - self.peak_equity) * 10.0
+        local_dd = max(-3.0, min(0.0, local_dd))
+
+        # 3. Hit rate centrado em 0 (range [-0.5, 0.5])
+        hit_rate = sum(1.0 for x in buf if x > 0) / n - 0.5
+
+        feats = torch.tensor(
+            [[rolling_pnl, local_dd, hit_rate]],
+            device=self.device, dtype=dtype,
+        )
+        return feats.expand(batch_size, -1)
+
+
+# ---------------------------------------------------------------------------
 # Motor principal
 # ---------------------------------------------------------------------------
 
@@ -188,7 +256,7 @@ class WalkForwardEngine:
                 out_features=2,
                 num_nodes=8,
                 state_dim=16,
-                max_hops=2,
+                max_hops=3,
                 context_dim=16,
                 output_scale_init=(0.01, 1.0),
                 learnable_output_scale=True,
@@ -203,13 +271,13 @@ class WalkForwardEngine:
             predictors[tf].multi_scale_builder.to(self.device)
 
         predictor_signal_features = len(self.TIMEFRAMES)
-        trader_features = n_features + predictor_signal_features + 1
+        trader_features = n_features + predictor_signal_features + 1 + N_PERF_FEATURES
         trader_model = HSAMA(
             in_features=trader_features,
             out_features=2,
             num_nodes=8,
             state_dim=16,
-            max_hops=2,
+            max_hops=3,
             context_dim=16,
             output_scale_init=(1.0, 1.0),
             learnable_output_scale=True,
@@ -227,12 +295,12 @@ class WalkForwardEngine:
 
         trading_loss_fn = TriplexTradingLoss(
             cost_bps=TRADING_COST_BPS,
-            trade_weight=5.0,
+            trade_weight=50.0,
             return_scale=100.0,
             bias_weight=0.5,
             stagnation_threshold=0.7,
             stagnation_weight=0.5,
-            sharpe_weight=0.5,
+            sharpe_weight=0.0,
             position_deadzone=TRADER_POSITION_DEADZONE,
             gamma=0.0,
         )
@@ -381,6 +449,7 @@ class WalkForwardEngine:
             pred_optimizer_joint = torch.optim.AdamW(pred_params_joint, lr=1e-3)
     
             last_position = 0.0  # posição final do batch anterior para custo de borda
+            perf_tracker = RollingPerformanceTracker(window=PERF_WINDOW, device=self.device)
     
             for ep in range(JOINT_EPOCHS):
                 trader.model.train()
@@ -435,9 +504,12 @@ class WalkForwardEngine:
                     # Pseudo-Autoregressive Position Feedback (2-Pass Trick)
                     # -------------------------------------------------------------
                     with torch.no_grad():
+                        # Performance features (baseadas no passado, sem gradiente)
+                        perf_feats = perf_tracker.get_features(B, dtype=bx_15m.dtype)
+
                         # Pass 1: Estimate trajectory without valid past position
                         dummy_prev = torch.full((B, 1), last_position, device=self.device)
-                        bx_trade_dummy = torch.cat([bx_15m, pred_signals, dummy_prev], dim=1)
+                        bx_trade_dummy = torch.cat([bx_15m, pred_signals, dummy_prev, perf_feats], dim=1)
                         trader_ctx_d, _, _, _ = trader._prepare_context_batch(bx_trade_dummy, step=global_step)
                         pol_d = trader.model.build_policy_from_context(trader_ctx_d, surprisal=surprisal)
                         pred_d, _ = trader.model.execute_policy(bx_trade_dummy, pol_d, raw_output=True)
@@ -446,7 +518,7 @@ class WalkForwardEngine:
                         prev_positions = torch.roll(pos_estim, shifts=1, dims=0)
                         prev_positions[0] = last_position
     
-                    bx_trade = torch.cat([bx_15m, pred_signals, prev_positions], dim=1)
+                    bx_trade = torch.cat([bx_15m, pred_signals, prev_positions, perf_feats], dim=1)
     
                     trading_loss_fn.set_previous_position(last_position)
     
@@ -484,6 +556,15 @@ class WalkForwardEngine:
                         
                         # For logging stats, just use the directional part
                         pos_raw = torch.tanh(logits[:, 0:1])
+                        
+                        # Atualiza tracker de performance ANTES de sobrescrever last_position
+                        _pos_flat = posicoes.view(-1).cpu().numpy()
+                        _ret_flat = by_15m[:posicoes.shape[0]].view(-1).cpu().numpy()
+                        _prev_flat = np.roll(_pos_flat, 1)
+                        _prev_flat[0] = last_position
+                        _step_gross = _pos_flat * _ret_flat
+                        _step_cost = np.abs(_pos_flat - _prev_flat) * TRADING_COST_BPS
+                        perf_tracker.update(_step_gross - _step_cost)
                         
                         last_position = float(posicoes[-1].item())
                         ep_pnl_trade += (posicoes * by_15m[:posicoes.shape[0]]).sum().item()
@@ -542,6 +623,8 @@ class WalkForwardEngine:
                 B_oos = X_test_15m.size(0)
                 pred_trade_oos_list = []
                 curr_pos = torch.full((1, 1), last_position, device=self.device)
+                perf_tracker_oos = RollingPerformanceTracker(window=PERF_WINDOW, device=self.device)
+                oos_prev_pos_val = last_position
                 
                 print("   -> Simulando OOS step-by-step (Autoregressivo)...")
                 for i in range(B_oos):
@@ -565,15 +648,28 @@ class WalkForwardEngine:
                     sig_raw_i = torch.cat(edges_i, dim=1)
                     sig_i = sig_normalizer.normalize_frozen(sig_raw_i)
                     
+                    # Performance features para o OOS
+                    perf_feats_i = perf_tracker_oos.get_features(1, dtype=X_test_15m.dtype)
+                    
                     # Trader
-                    bx_trade_i = torch.cat([X_test_15m[i:i+1], sig_i, curr_pos], dim=1)
+                    bx_trade_i = torch.cat([X_test_15m[i:i+1], sig_i, curr_pos, perf_feats_i], dim=1)
                     t_ctx_i, t_latest_i, t_due_i, _ = trader._prepare_context_batch(bx_trade_i, step=test_start_step + i)
                     t_pol_i = trader.model.build_policy_from_context(t_ctx_i, surprisal=0.0)
                     t_pred_i, _ = trader.model.execute_policy(bx_trade_i, t_pol_i, raw_output=True)
                     trader.multi_scale_builder.commit_contexts(t_latest_i, due_scale_names=t_due_i, step=test_start_step + i + 1)
                     
                     pred_trade_oos_list.append(t_pred_i)
-                    curr_pos = position_from_logits(t_pred_i, deadzone=0.0)
+                    new_pos = position_from_logits(t_pred_i, deadzone=0.0)
+                    
+                    # Atualiza tracker de performance OOS
+                    actual_pos_i = position_from_logits(t_pred_i, deadzone=TRADER_POSITION_DEADZONE)
+                    step_ret_i = float(Y_test_15m[i, 0].item())
+                    step_gross_i = float(actual_pos_i.item()) * step_ret_i
+                    step_cost_i = abs(float(actual_pos_i.item()) - oos_prev_pos_val) * TRADING_COST_BPS
+                    perf_tracker_oos.update(np.array([step_gross_i - step_cost_i]))
+                    oos_prev_pos_val = float(actual_pos_i.item())
+                    
+                    curr_pos = new_pos
                 
                 print("      OOS Progresso: 100.0%")
                 pred_trade_oos = torch.cat(pred_trade_oos_list, dim=0)
